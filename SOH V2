@@ -1,0 +1,31 @@
+SELECT
+  rc.name AS company,
+  slw.name AS warehouse,
+  ("pt"."name" #>> array['en_US']) :: text AS "Product",
+  pp.default_code AS sku,
+  sl.complete_name AS location,
+  pt.detailed_type AS "Product type",
+  slo.name AS lot,
+  si.opening_unit_price,
+  si.closing_unit_price,
+--   si.op_in_qty,
+--   si.op_out_qty,
+  si.opening_qty,
+  si.in_qty,
+  si.out_qty,
+  si.closing_qty,
+--   si.op_in_valuation,
+--   si.op_out_valuation,
+  si.opening_valuation,
+--   si.cl_in_valuation,
+--   si.cl_out_valuation,
+  si.closing_valuation
+FROM
+  stock_inv si
+  JOIN product_product pp ON si.product_id = pp.id
+  JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  JOIN stock_location sl ON si.location_id = sl.id
+  LEFT JOIN stock_lot slo ON si.lot_id = slo.id
+  LEFT JOIN stock_warehouse slw ON sl.warehouse_id = slw.id
+  JOIN res_company rc ON si.company_id = rc.id
+
