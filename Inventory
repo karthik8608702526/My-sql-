@@ -1,0 +1,156 @@
+WITH date_bounds AS (
+    SELECT 
+        CURRENT_DATE - INTERVAL '30 days' AS start_date,
+        CURRENT_DATE AS end_date
+),
+
+-- Live current stock on hand from stock_quant
+current_stock AS (
+    SELECT 
+        sq.product_id,
+        stock_warehouse.id AS warehouse_id,
+        stock_warehouse.name AS warehouse_name,
+        SUM(sq.quantity) AS current_on_hand_qty
+    FROM stock_quant sq
+    JOIN stock_location sl ON sq.location_id = sl.id
+    LEFT JOIN stock_warehouse ON sl.parent_path LIKE '%' || stock_warehouse.view_location_id || '/%'
+    WHERE sl.usage = 'internal'
+    GROUP BY sq.product_id, stock_warehouse.id, stock_warehouse.name
+),
+
+-- Blocked Qty: Orders placed but pending fulfillment (Shortage/Reserved on Open Sales)
+order_placed_stock AS (
+    SELECT 
+        sol.product_id,
+        so.warehouse_id,
+        SUM(GREATEST(0, sol.product_uom_qty - COALESCE(sol.qty_delivered, 0))) AS order_placed_qty
+    FROM sale_order_line sol
+    JOIN sale_order so ON sol.order_id = so.id
+    WHERE so.state IN ('sale', 'done')
+      AND (sol.product_uom_qty - COALESCE(sol.qty_delivered, 0)) > 0
+    GROUP BY sol.product_id, so.warehouse_id
+),
+
+-- Period inventory movements
+move_data AS (
+    SELECT 
+        stock_move.product_id,
+        stock_warehouse.id AS warehouse_id,
+        stock_warehouse.name AS warehouse_name,
+
+        -- Receipt Qty
+        SUM(
+            CASE 
+                WHEN stock_move.date::date >= (SELECT start_date FROM date_bounds)
+                     AND sl_dest.usage = 'internal' 
+                     AND sl_src.usage = 'supplier' THEN stock_move.product_qty
+                ELSE 0 
+            END
+        ) AS receipt_qty,
+
+        -- Sales / Outward Qty
+        SUM(
+            CASE 
+                WHEN stock_move.date::date >= (SELECT start_date FROM date_bounds)
+                     AND sl_src.usage = 'internal' 
+                     AND sl_dest.usage = 'customer' THEN stock_move.product_qty
+                ELSE 0 
+            END
+        ) AS sales_qty,
+
+        -- Adjustment Qty
+        SUM(
+            CASE 
+                WHEN stock_move.date::date >= (SELECT start_date FROM date_bounds) THEN
+                    CASE 
+                        WHEN sl_dest.usage = 'internal' AND sl_src.usage = 'inventory' THEN stock_move.product_qty
+                        WHEN sl_src.usage = 'internal' AND sl_dest.usage = 'inventory' THEN -stock_move.product_qty
+                        ELSE 0 
+                    END
+                ELSE 0 
+            END
+        ) AS adjustment_qty,
+
+        -- Damage Qty (Scrapped Stock)
+        SUM(
+            CASE 
+                WHEN stock_move.date::date >= (SELECT start_date FROM date_bounds)
+                     AND sl_src.usage = 'internal' 
+                     AND sl_dest.scrap_location = true THEN stock_move.product_qty
+                ELSE 0 
+            END
+        ) AS damage_qty
+
+    FROM stock_move
+    JOIN stock_location sl_src ON stock_move.location_id = sl_src.id
+    JOIN stock_location sl_dest ON stock_move.location_dest_id = sl_dest.id
+    LEFT JOIN stock_warehouse ON (
+        (sl_dest.usage = 'internal' AND sl_dest.parent_path LIKE '%' || stock_warehouse.view_location_id || '/%')
+        OR (sl_src.usage = 'internal' AND sl_src.parent_path LIKE '%' || stock_warehouse.view_location_id || '/%')
+    )
+    WHERE stock_move.state = 'done'
+    [[ AND {{date_filter}} ]]
+    GROUP BY stock_move.product_id, stock_warehouse.id, stock_warehouse.name
+),
+
+inventory_summary AS (
+    SELECT 
+        CURRENT_DATE AS snapshot_date,
+        pp.id AS product_key,
+        COALESCE(cs.warehouse_name, md.warehouse_name, stock_warehouse.name, 'Main Warehouse') AS location,
+        
+        COALESCE(cs.current_on_hand_qty, 0) AS closing_qty,
+        COALESCE(md.receipt_qty, 0) AS receipt_qty,
+        COALESCE(md.sales_qty, 0) AS sales_qty,
+        COALESCE(md.adjustment_qty, 0) AS adjustment_qty,
+        COALESCE(md.damage_qty, 0) AS damage_qty,
+        COALESCE(ops.order_placed_qty, 0) AS blocked_qty,
+        
+        -- Opening Qty calculated back from current stock on hand
+        (
+            COALESCE(cs.current_on_hand_qty, 0) 
+            - COALESCE(md.receipt_qty, 0) 
+            - COALESCE(md.adjustment_qty, 0) 
+            + COALESCE(md.sales_qty, 0) 
+            + COALESCE(md.damage_qty, 0)
+        ) AS opening_qty,
+        
+        -- Unit Cost
+        COALESCE(ip.value_float, pt.list_price, 0) AS unit_cost
+
+    FROM product_product pp
+    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+    LEFT JOIN current_stock cs ON pp.id = cs.product_id
+    LEFT JOIN move_data md ON pp.id = md.product_id AND (cs.warehouse_id IS NULL OR cs.warehouse_id = md.warehouse_id)
+    LEFT JOIN order_placed_stock ops ON pp.id = ops.product_id AND (cs.warehouse_id IS NULL OR cs.warehouse_id = ops.warehouse_id)
+    LEFT JOIN ir_property ip ON (
+        ip.name = 'standard_price' 
+        AND ip.res_id = 'product.product,' || pp.id
+        AND ip.company_id IS NULL
+    )
+    LEFT JOIN stock_warehouse ON stock_warehouse.id = COALESCE(cs.warehouse_id, md.warehouse_id)
+    WHERE pt.type = 'product'
+      AND (pp.default_code IS NULL OR pp.default_code NOT ILIKE '%SER%')
+)
+
+SELECT 
+    i.snapshot_date AS "SnapshotDate",
+    i.product_key AS "ProductKey",
+    i.location AS "Location",
+    i.opening_qty AS "OpeningQty",
+    i.receipt_qty AS "ReceiptQty",
+    i.sales_qty AS "SalesQty",
+    i.adjustment_qty AS "AdjustmentQty",
+    i.damage_qty AS "DamageQty",
+    i.closing_qty AS "ClosingQty",
+    ROUND((i.closing_qty * i.unit_cost)::numeric, 2) AS "InventoryValue",
+    i.blocked_qty AS "BlockedQty"
+
+FROM inventory_summary i
+LEFT JOIN stock_warehouse ON stock_warehouse.name = i.location
+
+WHERE 1=1
+    [[ AND {{warehouse_filter}} ]]
+
+ORDER BY 
+    i.closing_qty ASC;
