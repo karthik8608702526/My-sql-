@@ -1,0 +1,61 @@
+SELECT 
+    res_partner.id AS "SupplierKey",
+    COALESCE(
+        CASE WHEN res_partner.name::text ILIKE '{%' THEN res_partner.name::jsonb->>'en_US' ELSE res_partner.name::text END
+    ) AS "SupplierName",
+    STRING_AGG(
+        DISTINCT COALESCE(
+            CASE WHEN res_partner_category.name::text ILIKE '{%' THEN res_partner_category.name::jsonb->>'en_US' ELSE res_partner_category.name::text END
+        ), ', '
+    ) AS "SupplierCategory",
+    CONCAT_WS(', ', 
+        res_partner.city, 
+        CASE WHEN st.name::text ILIKE '{%' THEN st.name::jsonb->>'en_US' ELSE st.name::text END, 
+        CASE WHEN c.name::text ILIKE '{%' THEN c.name::jsonb->>'en_US' ELSE c.name::text END
+    ) AS "Region",
+    pt.default_code AS "SKU",
+    
+    -- Calculated Actual Lead Times (in days)
+    COALESCE(ROUND(AVG(EXTRACT(DAY FROM (po.effective_date - po.date_order)))), 0) AS "AvgLeadTimeDays",
+    COALESCE(ROUND(MAX(EXTRACT(DAY FROM (po.effective_date - po.date_order)))), 0) AS "MaxLeadTimeDays",
+    
+    '30' AS "PaymentTermsDays",
+    
+    -- Dynamic Supplier Rating based on Average Lead Time Performance
+    CASE 
+        WHEN COALESCE(ROUND(AVG(EXTRACT(DAY FROM (po.effective_date - po.date_order)))), 0) <= 7 THEN 'High'
+        WHEN COALESCE(ROUND(AVG(EXTRACT(DAY FROM (po.effective_date - po.date_order)))), 0) BETWEEN 8 AND 15 THEN 'Medium'
+        ELSE 'Low'
+    END AS "SupplierRating"
+FROM 
+    res_partner
+LEFT JOIN 
+    res_country_state st ON res_partner.state_id = st.id
+LEFT JOIN 
+    res_country c ON res_partner.country_id = c.id
+LEFT JOIN 
+    purchase_order po ON res_partner.id = po.partner_id AND po.state IN ('purchase', 'done')
+LEFT JOIN 
+    purchase_order_line pol ON po.id = pol.order_id
+LEFT JOIN 
+    product_product pp ON pol.product_id = pp.id
+LEFT JOIN 
+    product_template pt ON pp.product_tmpl_id = pt.id
+LEFT JOIN 
+    res_partner_res_partner_category_rel rel ON res_partner.id = rel.partner_id
+LEFT JOIN 
+    res_partner_category ON rel.category_id = res_partner_category.id
+WHERE 
+    (res_partner.supplier_rank > 0 OR res_partner.is_company = TRUE)
+    AND res_partner.name NOT ILIKE '%Isha Life%'
+    AND res_partner.name NOT ILIKE '%Mallige%'
+    AND (res_partner_category.name IS NULL OR res_partner_category.name::text NOT ILIKE '%Viras%')
+    [[ AND {{supplier_filter}} ]]
+    [[ AND {{supplier_category_filter}} ]]
+GROUP BY 
+    res_partner.id,
+    res_partner.name,
+    res_partner.city,
+    st.name,
+    c.name,
+    pt.default_code;
