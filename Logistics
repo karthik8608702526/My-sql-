@@ -1,0 +1,109 @@
+SELECT 
+    sale_order.name AS order_id,
+    COALESCE(
+        CASE WHEN carrier_pt.name::text ILIKE '{%' THEN carrier_pt.name::jsonb->>'en_US' ELSE carrier_pt.name::text END,
+        CASE WHEN carrier_pt_so.name::text ILIKE '{%' THEN carrier_pt_so.name::jsonb->>'en_US' ELSE carrier_pt_so.name::text END
+    ) AS carrier,
+    
+    -- 1. PROMISED DATE (Commitment Date -> Fallback to Scheduled Date)
+    COALESCE(
+        sale_order.commitment_date::date,
+        sp.scheduled_date::date
+    ) AS promise_date,
+
+    -- 2. DISPATCH DATE
+    sp.date_done::date AS dispatch_date,
+    
+    -- 3. DELIVERY DATE
+    COALESCE(sp.date_done::date, sp.scheduled_date::date) AS delivery_date,
+    
+    -- FREIGHT COST (Matching Magento shipping description in sale order line)
+    COALESCE(
+        (
+            SELECT SUM(sol.price_subtotal)
+            FROM sale_order_line sol
+            WHERE sol.order_id = sale_order.id 
+              AND (
+                  sol.name::text ILIKE '%shipping%'
+                  OR sol.name::text ILIKE '%freight%'
+                  OR sol.name::text ILIKE '%delivery%'
+              )
+        ),
+        0.00
+    ) AS freight_cost,
+    
+    -- Transit Days
+    CASE 
+        WHEN sp.date_done IS NOT NULL AND sp.scheduled_date IS NOT NULL THEN 
+            GREATEST(0, (sp.date_done::date - sp.scheduled_date::date))
+        ELSE 0 
+    END AS transit_days,
+    
+    -- Delay Days
+    CASE 
+        WHEN sp.date_done IS NOT NULL AND COALESCE(sale_order.commitment_date, sp.scheduled_date) IS NOT NULL THEN 
+            GREATEST(0, (sp.date_done::date - COALESCE(sale_order.commitment_date, sp.scheduled_date)::date))
+        WHEN sp.date_done IS NULL AND COALESCE(sale_order.commitment_date, sp.scheduled_date) IS NOT NULL 
+             AND CURRENT_DATE > COALESCE(sale_order.commitment_date, sp.scheduled_date)::date THEN 
+            (CURRENT_DATE - COALESCE(sale_order.commitment_date, sp.scheduled_date)::date)
+        ELSE 0 
+    END AS delay_days,
+    
+    -- OTIF %
+    CASE 
+        WHEN (sp.date_done::date <= COALESCE(sale_order.commitment_date, sp.scheduled_date)::date 
+             OR COALESCE(sale_order.commitment_date, sp.scheduled_date) IS NULL)
+             AND sp.state = 'done' THEN 100.00
+        ELSE 0.00 
+    END AS otif_percent,
+    
+    -- Cost Per Order
+    COALESCE(
+        (
+            SELECT SUM(sol.price_subtotal)
+            FROM sale_order_line sol
+            WHERE sol.order_id = sale_order.id 
+              AND (
+                  sol.name::text ILIKE '%shipping%'
+                  OR sol.name::text ILIKE '%freight%'
+                  OR sol.name::text ILIKE '%delivery%'
+              )
+        ),
+        0.00
+    ) AS cost_per_order
+
+FROM 
+    sale_order
+LEFT JOIN 
+    stock_picking sp ON sp.sale_id = sale_order.id AND sp.state = 'done'
+
+-- Delivery Carrier Joins
+LEFT JOIN 
+    delivery_carrier ON delivery_carrier.id = COALESCE(sp.carrier_id, sale_order.carrier_id)
+LEFT JOIN 
+    delivery_carrier carrier_sp ON sp.carrier_id = carrier_sp.id
+LEFT JOIN 
+    product_product carrier_pp ON carrier_sp.product_id = carrier_pp.id
+LEFT JOIN 
+    product_template carrier_pt ON carrier_pp.product_tmpl_id = carrier_pt.id
+
+-- Fallback Delivery Carrier Joins
+LEFT JOIN 
+    delivery_carrier carrier_so ON sale_order.carrier_id = carrier_so.id
+LEFT JOIN 
+    product_product carrier_pp_so ON carrier_so.product_id = carrier_pp_so.id
+LEFT JOIN 
+    product_template carrier_pt_so ON carrier_pp_so.product_tmpl_id = carrier_pt_so.id
+
+LEFT JOIN 
+    stock_warehouse ON sale_order.warehouse_id = stock_warehouse.id
+
+WHERE 
+    sale_order.state IN ('sale', 'done')
+    AND COALESCE(sp.carrier_id, sale_order.carrier_id) IS NOT NULL
+    [[ AND {{warehouse_filter}} ]]
+    [[ AND {{carrier_filter}} ]]
+    [[ AND {{date_filter}} ]]
+
+ORDER BY 
+    sale_order.date_order DESC;
