@@ -1,0 +1,368 @@
+WITH date_config AS (
+    -- Precise date boundaries and month/day counts
+    SELECT
+        date_trunc('month', CURRENT_DATE)::date AS end_date,
+        (date_trunc('month', CURRENT_DATE) - INTERVAL '6 months')::date AS start_6m,
+        date_part('day', (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month' - INTERVAL '1 day'))::numeric AS days_current_month,
+        (date_trunc('month', CURRENT_DATE)::date - (date_trunc('month', CURRENT_DATE) - INTERVAL '6 months')::date)::numeric AS days_6m
+),
+allowed_warehouses AS (
+    -- Filtered Warehouse IDs
+    SELECT id AS warehouse_id
+    FROM stock_warehouse
+    WHERE name IN (
+        'FG Warehouse MP',
+        'FG Warehouse MP 1',
+        'FG Warehouse NS'
+    )
+),
+base_costs AS (
+    SELECT 
+        pp.id AS product_id,
+        pp.product_tmpl_id,
+        COALESCE(
+            NULLIF(prop_p.value_float, 0),
+            NULLIF(prop_t.value_float, 0),
+            NULLIF(CASE WHEN prop_p.value_reference ~ '^[0-9]+(\.[0-9]+)?$' THEN prop_p.value_reference::numeric ELSE 0 END, 0),
+            NULLIF(CASE WHEN prop_t.value_reference ~ '^[0-9]+(\.[0-9]+)?$' THEN prop_t.value_reference::numeric ELSE 0 END, 0),
+            0
+        ) AS direct_cost
+    FROM product_product pp
+    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+    LEFT JOIN ir_property prop_p 
+        ON prop_p.res_id = 'product.product,' || pp.id 
+       AND prop_p.name = 'standard_price'
+       AND (prop_p.company_id IS NULL OR prop_p.company_id = 1)
+    LEFT JOIN ir_property prop_t 
+        ON prop_t.res_id = 'product.template,' || pt.id 
+       AND prop_t.name = 'standard_price'
+       AND (prop_t.company_id IS NULL OR prop_t.company_id = 1)
+),
+stock_valuation_cost AS (
+    SELECT DISTINCT ON (product_id)
+        product_id,
+        unit_cost
+    FROM stock_valuation_layer
+    WHERE unit_cost > 0
+    ORDER BY product_id, create_date DESC, id DESC
+),
+bom_calculated AS (
+    SELECT 
+        bom.product_id AS target_product_id,
+        bom.product_tmpl_id AS target_tmpl_id,
+        SUM(line.product_qty * bc.direct_cost) AS bom_total_cost
+    FROM mrp_bom bom
+    JOIN mrp_bom_line line ON line.bom_id = bom.id
+    JOIN base_costs bc ON line.product_id = bc.product_id
+    WHERE bom.active = TRUE
+    GROUP BY bom.id, bom.product_id, bom.product_tmpl_id
+),
+sales_so AS (
+    SELECT 
+        sol.product_id,
+        so.date_order::date AS sales_date,
+        date_trunc('month', so.date_order)::date AS sales_month,
+        SUM(sol.product_uom_qty) AS qty
+    FROM sale_order_line sol
+    JOIN sale_order so ON sol.order_id = so.id
+    JOIN allowed_warehouses aw ON aw.warehouse_id = so.warehouse_id
+    CROSS JOIN date_config dc
+    WHERE so.state NOT IN ('draft', 'cancel')
+      AND so.date_order >= dc.start_6m
+      AND so.date_order < dc.end_date
+    GROUP BY sol.product_id, so.date_order::date, date_trunc('month', so.date_order)::date
+),
+sales_pos AS (
+    SELECT 
+        pol.product_id,
+        po.date_order::date AS sales_date,
+        date_trunc('month', po.date_order)::date AS sales_month,
+        SUM(pol.qty) AS qty
+    FROM pos_order_line pol
+    JOIN pos_order po ON pol.order_id = po.id
+    JOIN pos_session ps ON po.session_id = ps.id
+    JOIN pos_config pc ON ps.config_id = pc.id
+    JOIN stock_picking_type spt ON pc.picking_type_id = spt.id
+    JOIN allowed_warehouses aw ON aw.warehouse_id = spt.warehouse_id
+    CROSS JOIN date_config dc
+    WHERE po.state IN ('done', 'invoiced', 'paid')
+      AND po.date_order >= dc.start_6m
+      AND po.date_order < dc.end_date
+    GROUP BY pol.product_id, po.date_order::date, date_trunc('month', po.date_order)::date
+),
+daily_combined_sales AS (
+    SELECT 
+        product_id,
+        sales_date,
+        sales_month,
+        SUM(qty) AS daily_qty
+    FROM (
+        SELECT product_id, sales_date, sales_month, qty FROM sales_so
+        UNION ALL
+        SELECT product_id, sales_date, sales_month, qty FROM sales_pos
+    ) combined_daily
+    GROUP BY product_id, sales_date, sales_month
+),
+monthly_demand_pivoted AS (
+    -- Breakdown demand across the 6 historical months relative to end_date
+    SELECT 
+        product_id,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '6 months' THEN daily_qty ELSE 0 END) AS demand_month_1,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '5 months' THEN daily_qty ELSE 0 END) AS demand_month_2,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '4 months' THEN daily_qty ELSE 0 END) AS demand_month_3,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '3 months' THEN daily_qty ELSE 0 END) AS demand_month_4,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '2 months' THEN daily_qty ELSE 0 END) AS demand_month_5,
+        SUM(CASE WHEN sales_month = dc.end_date - INTERVAL '1 month'  THEN daily_qty ELSE 0 END) AS demand_month_6,
+        ROUND(SUM(daily_qty) / 6.0, 2) AS avg_monthly_demand
+    FROM daily_combined_sales
+    CROSS JOIN date_config dc
+    GROUP BY product_id, dc.end_date
+),
+aggregated_sales AS (
+    SELECT 
+        product_id,
+        SUM(daily_qty) AS total_sold_6m,
+        MAX(daily_qty) AS max_daily_sales,
+        COUNT(DISTINCT sales_date) AS active_days,
+        STDDEV_SAMP(daily_qty) AS stddev_daily_sales
+    FROM daily_combined_sales
+    GROUP BY product_id
+),
+fsn_xyz_calculated AS (
+    SELECT 
+        s.product_id,
+        s.total_sold_6m,
+        s.max_daily_sales,
+        CASE 
+            WHEN s.total_sold_6m > 0 AND s.active_days > 1 
+            THEN COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / s.active_days)
+            ELSE 999 
+        END AS cv_demand,
+        CASE 
+            WHEN COALESCE(s.total_sold_6m, 0) = 0 THEN 'N'
+            WHEN s.total_sold_6m >= 100 THEN 'F'
+            ELSE 'S'
+        END AS fsn_classification,
+        CASE 
+            WHEN COALESCE(s.total_sold_6m, 0) = 0 THEN 'Z'
+            WHEN (COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / NULLIF(s.active_days, 0))) <= 0.5 THEN 'X'
+            WHEN (COALESCE(s.stddev_daily_sales, 0) / (s.total_sold_6m / NULLIF(s.active_days, 0))) <= 1.0 THEN 'Y'
+            ELSE 'Z'
+        END AS xyz_classification
+    FROM aggregated_sales s
+),
+pr_receipt_lead_times AS (
+    SELECT 
+        prl.product_id,
+        ROUND(
+            AVG(EXTRACT(DAY FROM (sm.date - COALESCE(pr.date_start, pr.create_date))))::numeric / 30.0, 2
+        ) AS pr_avg_lead_time_months,
+        ROUND(
+            MAX(EXTRACT(DAY FROM (sm.date - COALESCE(pr.date_start, pr.create_date))))::numeric / 30.0, 2
+        ) AS pr_max_lead_time_months
+    FROM purchase_request_line prl
+    JOIN purchase_request pr 
+        ON prl.request_id = pr.id
+    JOIN res_users ru 
+        ON pr.requested_by = ru.id
+    JOIN res_partner rp 
+        ON ru.partner_id = rp.id
+    JOIN purchase_request_purchase_order_line_rel rel 
+        ON rel.purchase_request_line_id = prl.id
+    JOIN purchase_order_line pol 
+        ON pol.id = rel.purchase_order_line_id
+    JOIN stock_move sm 
+        ON sm.purchase_line_id = pol.id
+    WHERE pr.state IN ('approved', 'done')
+      AND sm.state = 'done'
+      AND COALESCE(pr.date_start, pr.create_date) IS NOT NULL
+      AND sm.date >= COALESCE(pr.date_start, pr.create_date)
+      AND rp.name IN (
+          'Divyaprakash Vijayakumar',
+          'Mahendran Ponnusamy',
+          'Meena Vajravelu',
+          'kirthika Muniappan'
+      )
+    GROUP BY prl.product_id
+),
+partner_lookup AS (
+    SELECT DISTINCT ON (psi.product_tmpl_id)
+        psi.product_tmpl_id,
+        rp.name AS partner_name
+    FROM product_supplierinfo psi
+    JOIN res_partner rp ON rp.id = psi.partner_id
+    ORDER BY psi.product_tmpl_id, psi.sequence ASC, psi.id DESC
+),
+last_movement AS (
+    SELECT 
+        sm.product_id,
+        (CURRENT_DATE - MAX(sm.date)::date) AS days_since_last_movement
+    FROM stock_move sm
+    JOIN stock_location loc ON sm.location_dest_id = loc.id OR sm.location_id = loc.id
+    JOIN allowed_warehouses aw ON loc.warehouse_id = aw.warehouse_id
+    WHERE sm.state = 'done'
+    GROUP BY sm.product_id
+),
+cv_metrics AS (
+    SELECT 
+        product_id,
+        CASE 
+            WHEN cv_demand >= 999 THEN NULL 
+            ELSE ROUND((cv_demand * 100)::numeric, 2)
+        END AS cv_percent
+    FROM fsn_xyz_calculated
+)
+
+SELECT DISTINCT ON (pp.id)
+    pp.default_code                                         AS internal_reference,
+    pp.barcode                                              AS barcode,
+    
+    CASE 
+        WHEN pg_typeof(pt.name)::text = 'jsonb' OR pg_typeof(pt.name)::text = 'json' 
+        THEN COALESCE(pt.name->>'en_US', pt.name::text)
+        ELSE pt.name::text
+    END                                                     AS product_name,
+
+    '[' || pp.default_code || '] ' || 
+    CASE 
+        WHEN pg_typeof(pt.name)::text = 'jsonb' OR pg_typeof(pt.name)::text = 'json' 
+        THEN COALESCE(pt.name->>'en_US', pt.name::text)
+        ELSE pt.name::text
+    END                                                     AS description_full,
+    
+    map.mtkg_category_l1,
+    map.target_month,
+    map.abc                                                 AS abc_classification,
+
+    COALESCE(fx.fsn_classification, 'N')                    AS fsn_classification,
+    COALESCE(fx.xyz_classification, 'Z')                    AS xyz_classification,
+    map.abc || COALESCE(fx.xyz_classification, 'Z')         AS abc_xyz_matrix,
+
+    CASE 
+        WHEN pl.partner_name IN (
+            'Isha Business Pvt Ltd',
+            'Isha Crafts Private Limited',
+            'Isha Design',
+            'Isha Education',
+            'Isha Foundation',
+            'Isha Foundation - Delhi',
+            'Isha Foundation - Karnataka',
+            'Isha Home School',
+            'Isha Institute of Inner Sciences',
+            'Isha Life Hyderabad Yoga Studio LLP',
+            'Isha Outreach',
+            'Isha Outreach - Karnataka',
+            'Isha Sacred Walks',
+            'Isha Utsav',
+            'Sadhguru Academy',
+            'Sadhguru Academy - KA',
+            'Shri Yogini Trust',
+            'Thenkailaya Bakthi Peravai'
+        ) THEN 'Isha Entities'
+        ELSE ''
+    END                                                     AS partner_type,
+
+    COALESCE(pr_lt.pr_avg_lead_time_months, 0)              AS pr_to_receipt_avg_lead_time_months,
+    COALESCE(pr_lt.pr_max_lead_time_months, 0)              AS pr_to_receipt_max_lead_time_months,
+
+    COALESCE(
+        NULLIF(bc.direct_cost, 0), 
+        svl.unit_cost,
+        bom_calc_var.bom_total_cost,
+        bom_calc_tmpl.bom_total_cost,
+        0
+    )                                                       AS cost_price,
+
+    pt.list_price                                           AS mrp,
+
+    ROUND(
+        COALESCE(
+            NULLIF(pt.expiration_time, 0), 
+            NULLIF(pt.use_time, 0), 
+            0
+        ) / 30.0, 1
+    )                                                       AS shelf_life_months,
+
+    ROUND(
+        CASE 
+            WHEN dc.days_6m > 0 THEN COALESCE(sales.total_sold_6m, 0) / dc.days_6m 
+            ELSE 0 
+        END, 2
+    )                                                       AS daily_avg_sales_qty,
+
+    COALESCE(sales.max_daily_sales, 0)                      AS max_daily_sales_qty,
+
+    ROUND(
+        (
+            CASE 
+                WHEN dc.days_6m > 0 THEN COALESCE(sales.total_sold_6m, 0) / dc.days_6m 
+                ELSE 0 
+            END
+        ) * dc.days_current_month, 0
+    )                                                       AS "6M Avg Sales (Units/ Month)",
+
+    -- Historical Monthly Demand Breakdown (Past 6 Months)
+    COALESCE(md.demand_month_1, 0)                         AS demand_month_m6,
+    COALESCE(md.demand_month_2, 0)                         AS demand_month_m5,
+    COALESCE(md.demand_month_3, 0)                         AS demand_month_m4,
+    COALESCE(md.demand_month_4, 0)                         AS demand_month_m3,
+    COALESCE(md.demand_month_5, 0)                         AS demand_month_m2,
+    COALESCE(md.demand_month_6, 0)                         AS demand_month_m1,
+    COALESCE(md.avg_monthly_demand, 0)                     AS avg_monthly_demand_6m,
+
+    -- Movement & Variation Metrics
+    COALESCE(lm.days_since_last_movement, 9999)               AS days_since_last_movement,
+    cv.cv_percent                                             AS cv_percent
+
+FROM product_product pp
+JOIN product_template pt 
+    ON pp.product_tmpl_id = pt.id
+CROSS JOIN date_config dc
+
+LEFT JOIN base_costs bc
+    ON bc.product_id = pp.id
+
+LEFT JOIN stock_valuation_cost svl
+    ON svl.product_id = pp.id
+
+JOIN public.mktg_pdt_category_map map 
+    ON map.product_id = pp.id
+
+LEFT JOIN bom_calculated bom_calc_var
+    ON bom_calc_var.target_product_id = pp.id
+
+LEFT JOIN bom_calculated bom_calc_tmpl
+    ON bom_calc_tmpl.target_tmpl_id = pt.id
+
+LEFT JOIN aggregated_sales sales
+    ON sales.product_id = pp.id
+
+LEFT JOIN monthly_demand_pivoted md
+    ON md.product_id = pp.id
+
+LEFT JOIN fsn_xyz_calculated fx
+    ON fx.product_id = pp.id
+
+LEFT JOIN pr_receipt_lead_times pr_lt
+    ON pr_lt.product_id = pp.id
+
+LEFT JOIN partner_lookup pl
+    ON pl.product_tmpl_id = pt.id
+
+LEFT JOIN last_movement lm 
+    ON lm.product_id = pp.id
+
+LEFT JOIN cv_metrics cv 
+    ON cv.product_id = pp.id
+
+WHERE 
+    pp.default_code IS NOT NULL 
+    AND TRIM(pp.default_code) != ''
+    AND pp.default_code NOT ILIKE '%Old' 
+    AND pp.default_code NOT IN ('Delivery_007', 'TIPS', 'DISC')
+    AND pt.name::text NOT ILIKE '%Stainless Steel Scrap%'
+    AND pt.name::text NOT ILIKE '%Carton box scrap%'
+    AND pt.name::text NOT ILIKE '%50-Litre wet grinder%'
+    AND pt.name::text NOT ILIKE '12" Mini%'
+
+ORDER BY pp.id, map.target_month DESC NULLS LAST;
