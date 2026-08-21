@@ -1,0 +1,274 @@
+with date_config as (
+select
+date_trunc('month', current_date)::date  as end_date,
+(date_trunc('month', current_date) - interval '6 months')::date as start_6m,
+(date_trunc('month', current_date)::date
+- (date_trunc('month', current_date) - interval '6 months')::date)::numeric as days_6m),
+
+sku_unique as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+max((pt.name #>> array['en_US'])::text) as product_name,
+max(coalesce(orig.mtkg_category_l1, norm.mtkg_category_l1)) as l1,
+max(coalesce(orig.abc, norm.abc))   as abc
+from product_product pp
+join product_template pt on pp.product_tmpl_id = pt.id
+left join product_product pp_base on
+(pp.default_code like '%-IN' or pp.default_code like '%old')
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join mktg_pdt_category_map orig
+on coalesce(pp_base.id, pp.id) = orig.product_id
+left join product_product pp_norm on
+orig.mtkg_category_l1 is null
+and public.normalize_sku(pp.default_code) = pp_norm.default_code
+left join mktg_pdt_category_map norm on
+orig.mtkg_category_l1 is null
+and pp_norm.id = norm.product_id
+where pt.type != 'service'
+and   pp.active = true
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+lot_stock as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sl.name  as lot_id,
+(sl.expiration_date::date - pt.expiration_time::int) as creation_date,
+sl.expiration_date::date as expiry_date,
+pt.expiration_time   as shelf_life,
+sum(sq.quantity) as lot_soh
+from stock_lot sl
+join product_product pp  on sl.product_id = pp.id
+join product_template pt on pp.product_tmpl_id = pt.id
+left join product_product pp_base on
+(pp.default_code like '%-IN' or pp.default_code like '%old')
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join stock_quant sq on sq.lot_id = sl.id
+join stock_location loc on sq.location_id = loc.id
+join stock_warehouse w  on loc.warehouse_id = w.id
+where sl.expiration_date is not null
+and loc.complete_name ilike any (array['%Domestic%', 'MP1/Stock', 'SIN/Stock'])
+and w.name in ('FG Warehouse MP', 'FG Warehouse MP 1', 'FG Warehouse SIN')
+group by
+sl.id, sl.name, sl.expiration_date,
+pt.expiration_time, coalesce(pp_base.default_code, pp.default_code)
+having sum(sq.quantity) > 0),
+
+ecom_sales as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sol.product_uom_qty,
+sol.price_subtotal,
+so.date_order
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on
+(pp.default_code like '%-IN' or pp.default_code like '%old')
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join crm_team t on so.team_id = t.id
+where so.state not in ('draft', 'cancel')
+and (
+position('E-Com' in (t.name #>> array['en_US'])::text) > 0
+or position('Ecom' in (t.name #>> array['en_US'])::text) > 0)),
+
+non_ecom_sales as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sol.product_uom_qty,
+so.date_order
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on
+(pp.default_code like '%-IN' or pp.default_code like '%old')
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join crm_team t on so.team_id = t.id
+where so.state not in ('draft', 'cancel')
+and position('E-Com' in (t.name #>> array['en_US'])::text) = 0
+and position('Ecom'  in (t.name #>> array['en_US'])::text) = 0
+and (
+case
+when position('Amazon Sales - MA'in (t.name #>> array['en_US'])::text) > 0 then 'Amz MH'
+when position('Amazon Sales - TN'in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales CJB1- TN'in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - TN - MAA4' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - KA'in (t.name #>> array['en_US'])::text) > 0 then 'Amz KA'
+when position('Amazon Sales FBM - TN'in (t.name #>> array['en_US'])::text) > 0 then 'Amz FBM'
+when position('Local Sales - MH' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('MIAL Sales'   in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when (position('Export Sales' in (t.name #>> array['en_US'])::text) > 0
+or position('Local Sales'  in (t.name #>> array['en_US'])::text) > 0)
+and so.partner_id in (select id from res_partner where name = 'A P Exports') then 'A P Exports'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30307, 230462)  then 'IL Europe'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30305, 216914)  then 'IL UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 4953 then 'IF UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23980 then 'IF Australia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 132583   then 'IF Malaysia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23982 then 'IF Hong Kong'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 30303 then 'IF Canada'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 2006 then 'IF USA'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Yantra'
+when position('Local Sales'  in (t.name #>> array['en_US'])::text) > 0
+and so.partner_id in (
+select id from res_partner where name in (
+'Isha Business Pvt Ltd', 'Isha Crafts Private Limited', 'Isha Design', 'Isha Education',
+'Isha Foundation', 'Isha Foundation - Delhi', 'Isha Foundation - Karnataka', 'Isha Home School',
+'Isha Institute of Inner Sciences', 'Isha Life Hyderabad Yoga Studio LLP', 'Isha Outreach',
+'Isha Outreach - Karnataka', 'Isha Sacred Walks', 'Isha Utsav', 'Sadhguru Academy',
+'Sadhguru Academy - KA', 'Shri Yogini Trust', 'Thenkailaya Bakthi Peravai')) then 'Isha Entities'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 then 'B2B Vira'
+else (t.name #>> array['en_US'])::text
+end is not null)
+
+union all
+
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+pol.qty  as product_uom_qty,
+po.date_order
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on
+(pp.default_code like '%-IN' or pp.default_code like '%old')
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join account_journal aj on po.sale_journal = aj.id
+where po.state in ('done', 'invoiced', 'paid')
+and (aj.name #>> '{}')::text ilike any (array[
+'%TN Point of Sale%', '%CG Point of Sale%', '%PY Point of Sale%',
+'%KA Point of Sale%', '%UP Point of Sale%', '%DH Point of Sale%'])),
+
+agg_ecom as (
+select
+base_sku,
+sum(case when date_order >= dc.start_6m and date_order < dc.end_date
+then product_uom_qty else 0 end) as sold_6m,
+sum(case when date_order >= dc.start_6m and date_order < dc.end_date
+then price_subtotal else 0 end)  as revenue_6m,
+sum(case when date_order >= date_trunc('month', current_date) - interval '3 years'
+and date_order < dc.end_date
+then price_subtotal else 0 end)  as revenue_3y,
+sum(case when date_order >= date_trunc('month', current_date) - interval '3 years'
+and date_order < dc.end_date
+then product_uom_qty else 0 end) as sold_3y
+from ecom_sales
+cross join date_config dc
+group by base_sku),
+
+agg_non_ecom as (
+select
+base_sku,
+sum(case when date_order >= dc.start_6m and date_order < dc.end_date
+then product_uom_qty else 0 end) as sold_6m
+from non_ecom_sales
+cross join date_config dc
+group by base_sku),
+
+lot_computed as (
+select
+ls.*,
+dc.days_6m,
+coalesce(ae.sold_6m,  0)::numeric / nullif(dc.days_6m, 0)  as ecom_rate_6m,
+coalesce(ane.sold_6m, 0)::numeric / nullif(dc.days_6m, 0)  as non_ecom_rate_6m,
+(coalesce(ae.sold_6m, 0) + coalesce(ane.sold_6m, 0))::numeric / nullif(dc.days_6m, 0) as all_rate_6m,
+(ls.expiry_date - ls.creation_date)::numeric as sl_days,
+(ls.creation_date + make_interval(
+days => (((ls.expiry_date - ls.creation_date)::numeric) * 0.7)::int
+))::date as ecom_last_date,
+coalesce(
+nullif(ae.revenue_3y, 0) / nullif(ae.sold_3y, 0),
+nullif(ae.revenue_6m, 0) / nullif(ae.sold_6m, 0), 0) as avg_sp
+from lot_stock ls
+cross join date_config dc
+left join agg_ecom ae  on ls.base_sku = ae.base_sku
+left join agg_non_ecom ane on ls.base_sku = ane.base_sku),
+
+-- layer 1: shelf life and date scalars
+with_sl as (
+select
+lc.*,
+su.product_name,
+su.l1,
+su.abc,
+round(least(
+(current_date - lc.creation_date)::numeric / nullif(lc.sl_days, 0), 1
+), 4)   as shelf_life_consumed,
+round(1 - least(
+(current_date - lc.creation_date)::numeric / nullif(lc.sl_days, 0), 1
+), 4)   as remaining_sl,
+(lc.expiry_date - (lc.shelf_life * 0.10)::int)::date   as date_10pct,
+(lc.ecom_last_date - current_date)  as days_to_ecom_last,
+(lc.expiry_date- current_date)  as days_to_expiry
+from lot_computed lc
+join sku_unique su on lc.base_sku = su.base_sku
+where lc.base_sku not like '%-IN'
+and   lc.base_sku not like '%old'),
+
+-- layer 2: expected sales (so Risk Qty can reference them cleanly)
+with_forecast as (
+select
+w.*,
+round(least(
+w.all_rate_6m * greatest(w.days_to_ecom_last::numeric, 0),
+w.lot_soh::numeric
+), 0) as exp_ecom_offline
+from with_sl w),
+
+with_offline as (
+select
+f.*,
+round(least(
+greatest(f.days_to_expiry::numeric - greatest(f.days_to_ecom_last::numeric, 0), 0)
+* f.non_ecom_rate_6m,
+f.lot_soh::numeric - f.exp_ecom_offline
+), 0)   as exp_offline_post_ecom
+from with_forecast f)
+
+select
+product_name as "Product",
+base_sku as "SKU",
+l1  as "Category L1",
+abc as "ABC Classification",
+lot_id as "Lot ID",
+creation_date as "Creation Date",
+expiry_date as "Expiry Date",
+shelf_life  as "Shelf Life",
+lot_soh as "SOH",
+
+shelf_life_consumed as "Shelf Life Consumed",
+remaining_sl as "Remaining Shelf Life",
+case
+when remaining_sl > 0.7 then '2. 70-100%'
+when remaining_sl > 0.4 then '3. 40-70%'
+when remaining_sl > 0   then '4. 0-40%'
+else '1. Expired'
+end as "Remaining Shelf Life Bucket",
+
+round(all_rate_6m, 2)   as "All Channels Daily Avg QTY (6M)",
+round(ecom_rate_6m, 2)  as "Ecom Daily Avg (6M)",
+round(non_ecom_rate_6m, 2)  as "Non-Ecom Daily Avg (6M)",
+
+round(lot_soh::numeric / nullif(all_rate_6m, 0), 0)as "All Channels Days Coverage (6M)",
+
+ecom_last_date  as "Ecom Last Date of Sale",
+days_to_ecom_last   as "Days to Ecom Last Sale",
+days_to_expiry  as "Days to Expiry",
+
+round(avg_sp * lot_soh, 0)  as "Total Value (INR@SP)",
+
+date_10pct  as "Date for 10% Shelf Life Remaining",
+(date_10pct - current_date) as "Days to 10% Shelf Life Rem.",
+
+exp_ecom_offline as "Expected Sales - Ecom + Offline",
+exp_offline_post_ecom   as "Expected Sales Offline post last Ecom day",
+
+(exp_ecom_offline + exp_offline_post_ecom)  as "Total Forecasted Sales",
+
+round(greatest(
+lot_soh::numeric - (exp_ecom_offline + exp_offline_post_ecom),
+0), 0)  as "Risk Qty"
+
+from with_offline
+order by "All Channels Daily Avg QTY (6M)" desc nulls last,
+ "All Channels Days Coverage (6M)" asc nulls last,
+ lot_id;
