@@ -1,0 +1,39 @@
+SELECT DISTINCT ON (comp_pp.default_code)
+
+    -- Component / BoM Line Information (Unique by Code)
+    comp_pp.default_code AS component_internal_reference,
+    COALESCE(comp_pt.name->>'en_US', comp_pt.name->>'en_GB', comp_pt.name::text) AS component_name,
+    bom_line.product_qty AS component_quantity,
+    COALESCE(pu_comp.name->>'en_US', pu_comp.name::text) AS component_uom,
+
+    -- Parent Finished Good (FG) Information
+    
+    bom.id AS bom_id,
+    COALESCE(pt.name->>'en_US', pt.name->>'en_GB', pt.name::text) AS fg_product_name,
+    pp.default_code AS fg_internal_reference,
+    bom.product_qty AS fg_quantity,
+    COALESCE(pu_fg.name->>'en_US', pu_fg.name::text) AS fg_uom,
+    bom.type AS bom_type,
+    bom.code AS bom_reference,
+    bom_line.id AS bom_line_id
+
+FROM mrp_bom bom
+
+-- Join Parent Product Variant & Template
+
+LEFT JOIN product_product pp ON bom.product_id = pp.id
+LEFT JOIN product_template pt ON bom.product_tmpl_id = pt.id
+LEFT JOIN uom_uom pu_fg ON bom.product_uom_id = pu_fg.id
+
+-- Join BoM Lines (Components)
+
+INNER JOIN mrp_bom_line bom_line ON bom.id = bom_line.bom_id
+LEFT JOIN product_product comp_pp ON bom_line.product_id = comp_pp.id
+LEFT JOIN product_template comp_pt ON comp_pp.product_tmpl_id = comp_pt.id
+LEFT JOIN uom_uom pu_comp ON bom_line.product_uom_id = pu_comp.id
+
+WHERE comp_pp.default_code IS NOT NULL
+
+-- DISTINCT ON requires ordering by the evaluated column first
+
+ORDER BY comp_pp.default_code, bom.id, bom_line.id;
