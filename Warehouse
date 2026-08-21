@@ -1,0 +1,26 @@
+SELECT 
+    stock_warehouse.id AS warehouse_id,
+    COALESCE(
+        CASE WHEN stock_warehouse.name::text ILIKE '{%' THEN stock_warehouse.name::jsonb->>'en_US' ELSE stock_warehouse.name::text END
+    ) AS warehouse,
+    COALESCE(
+        CASE WHEN stock_location.complete_name::text ILIKE '{%' THEN stock_location.complete_name::jsonb->>'en_US' ELSE stock_location.complete_name::text END,
+        CASE WHEN stock_location.name::text ILIKE '{%' THEN stock_location.name::jsonb->>'en_US' ELSE stock_location.name::text END
+    ) AS location,
+    COALESCE(
+        SUM(sq.quantity), 0
+    ) AS capacity
+FROM 
+    stock_warehouse
+LEFT JOIN 
+    stock_location ON stock_location.id = stock_warehouse.lot_stock_id
+LEFT JOIN 
+    stock_quant sq ON sq.location_id = stock_location.id
+WHERE 
+    1=1
+    [[ AND {{warehouse_filter}} ]]
+GROUP BY 
+    stock_warehouse.id,
+    stock_warehouse.name,
+    stock_location.complete_name,
+    stock_location.name;
