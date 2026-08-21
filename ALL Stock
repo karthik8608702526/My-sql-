@@ -1,0 +1,85 @@
+with sku_unique as (
+select 
+pp.default_code as base_sku,
+max((pt.name #>> array['en_US'])::text) as product_name,
+max(coalesce(orig.mtkg_category_l1, norm.mtkg_category_l1)) as l1,
+max(coalesce(orig.abc, norm.abc)) as abc
+from product_product pp
+join product_template pt on pp.product_tmpl_id = pt.id
+left join mktg_pdt_category_map orig on pp.id = orig.product_id
+left join product_product pp_norm on
+orig.mtkg_category_l1 is null and public.normalize_sku(pp.default_code) = pp_norm.default_code
+left join mktg_pdt_category_map norm on
+orig.mtkg_category_l1 is null and pp_norm.id = norm.product_id
+where pt.type != 'service' and pp.active = true
+group by pp.default_code),
+
+stock_by_type as (
+select
+pp.default_code as base_sku,
+w.name as warehouse_name,
+case
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike any(array['%Putaway%', '%StockStaging/Inward%', '%QCMain%', '%QCStaging/Inward%'])
+then 'Pending Inward'
+when w.name in ('FG Warehouse MP 1', 'FG Warehouse MP', 'FG Warehouse NS')
+and (l.complete_name ilike '%Domestic%' or l.complete_name in ('MP1/Stock','NS/Stock/Domestic','%Container/CONT-%'))
+then 'Available'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%DMGStock/Near Expiry%'
+then 'Blocked-Near Expiry'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike any(array['%DMGQC/MEZ-%', '%DMGStock/DMG-%', '%DMGStock/Rework%', '%DMGStock/Scrap%', '%DMGStock/2nd Sale%'])
+then 'Blocked'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%FG/Photoshoot%'
+then 'Photo Shoot'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%StockStaging/Returns%'
+then 'RMA'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%Physical Locations/Rework%'
+then 'Rework'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike any(array['%Export/EXP-%', '%StockStaging/Allot-Export%', '%StockStaging/Output-%'])
+then 'Pending Invoice'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%QCSample/%'
+then 'Samples'
+when w.name = 'FG Warehouse MP'
+and l.complete_name ilike '%QCReturns/%'
+then 'QC Return'
+else null
+end as soh_type,
+sum(sq.quantity) as qty
+from stock_quant sq
+join stock_location l on sq.location_id = l.id
+join stock_warehouse w on w.id = l.warehouse_id
+join product_product pp on sq.product_id = pp.id
+where w.name in ('FG Warehouse MP', 'FG Warehouse MP 1', 'FG Warehouse NS')
+group by pp.default_code, w.name, soh_type)
+
+select
+su.product_name as "Product",
+su.base_sku as "SKU",
+su.l1 as "Category L1",
+su.abc as "ABC Classification",
+coalesce(sum(case when sbt.soh_type = 'Available' then sbt.qty end), 0) as "Available",
+coalesce(sum(case when sbt.soh_type = 'Available' and sbt.warehouse_name = 'FG Warehouse MP'  then sbt.qty end), 0) as "AVL.MP",
+coalesce(sum(case when sbt.soh_type = 'Available' and sbt.warehouse_name = 'FG Warehouse MP 1' then sbt.qty end), 0) as "AVL.MP1",
+coalesce(sum(case when sbt.soh_type = 'Available' and sbt.warehouse_name = 'FG Warehouse NS' then sbt.qty end), 0) as "AVL.NS",
+coalesce(sum(case when sbt.soh_type = 'Pending Inward'  then sbt.qty end), 0) as "Pending Inward",
+coalesce(sum(case when sbt.soh_type = 'Blocked-Near Expiry' then sbt.qty end), 0) as "Blocked - Near Expiry",
+coalesce(sum(case when sbt.soh_type = 'Blocked' then sbt.qty end), 0) as "Blocked - Damage",
+coalesce(sum(case when sbt.soh_type = 'Photo Shoot' then sbt.qty end), 0) as "Photo Shoot",
+coalesce(sum(case when sbt.soh_type = 'RMA' then sbt.qty end), 0) as "RMA",
+coalesce(sum(case when sbt.soh_type = 'Rework' then sbt.qty end), 0) as "Rework",
+coalesce(sum(case when sbt.soh_type = 'Pending Invoice' then sbt.qty end), 0) as "Pending Invoice",
+coalesce(sum(case when sbt.soh_type = 'Samples' then sbt.qty end), 0) as "Samples",
+coalesce(sum(case when sbt.soh_type = 'QC Return' then sbt.qty end), 0) as "QC Return",
+coalesce(sum(sbt.qty), 0) as "Total"
+from sku_unique su
+left join stock_by_type sbt on su.base_sku = sbt.base_sku
+where sbt.soh_type is not null
+group by su.product_name, su.base_sku, su.l1, su.abc
+order by "Available" desc nulls last;
