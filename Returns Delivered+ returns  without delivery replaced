@@ -1,0 +1,57 @@
+WITH orders AS (
+    SELECT
+        sale_order.id,
+        sale_order.name,
+        sale_order.date_order,
+        sale_order.amount_total AS order_value
+    FROM sale_order
+    JOIN crm_team ON crm_team.id = sale_order.team_id
+    WHERE LOWER(crm_team.name->>'en_US') LIKE '%ecom sale%'
+      AND sale_order.state <> 'draft'
+      AND {{order_date}}
+),
+reasons AS (
+    SELECT
+        rl.rma_id,
+        STRING_AGG(DISTINCT rr.rma_reason, ', ' ORDER BY rr.rma_reason)
+            AS return_no_return_reason,
+        STRING_AGG(DISTINCT rej.name, ', ' ORDER BY rej.name)
+            AS reject_reason
+    FROM rma_lines rl
+    LEFT JOIN rma_reason rr ON rr.id = rl.rma_reason_id
+    LEFT JOIN reject_reason rej ON rej.id = rl.reject_reason_id
+    GROUP BY rl.rma_id
+)
+SELECT
+    o.name AS sale_order,
+    o.order_value,
+    o.date_order,
+    r.name AS rma_number,
+    r.rma_type,
+    r.state AS rma_state,
+    CASE
+        WHEN r.rma_type = 'rma_with_do' THEN 'Delivered then returned'
+        WHEN r.rma_type = 'rma_with_out_do' THEN 'Returned without delivery'
+        WHEN r.rma_type = 'rma_invoice_cancellation' THEN 'Invoice cancelled + return'
+        WHEN r.rma_type = 'rma_do_order_without_invoice' THEN 'DO done without invoice return'
+        ELSE COALESCE(r.rma_type, 'Unknown')
+    END AS return_category,
+    rs.return_no_return_reason,
+    rs.reject_reason,
+    (
+        EXISTS (
+            SELECT 1
+            FROM rma_replace_order ro
+            WHERE ro.rma_id = r.id
+              AND COALESCE(ro.qty, 0) > 0
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM sale_order repl
+            WHERE repl.rma_id = r.id
+        )
+    ) AS is_returned_and_replaced
+FROM orders o
+JOIN rma_main r ON r.sale_order = o.id
+LEFT JOIN reasons rs ON rs.rma_id = r.id
+ORDER BY o.date_order DESC;
