@@ -1,0 +1,94 @@
+WITH location_mapping (loc_pattern, group_1, group_2) AS (
+    VALUES
+        ('AMZM',        'IL - TN Amazon',                   'Amazon'),
+        ('ARO',         'IL - TN Old MP Arogya',           'OLP MP'),
+        ('AY',          'ILS - KA Ashram',                 'PV'),
+        ('AYB',         'ILS - KA Ashram',                 'PV'),
+        ('BLBK',        'ILS - KA Ashram',                 'PV'),
+        ('BLR4',        'IL - KA 1 Amazon',                'Amazon'),
+        ('BLR8',        'IL - KA 2 Amazon',                'Amazon'),
+        ('BOM5',        'IL - MH 2 Amazon',                'Amazon'),
+        ('CHN',         'ILS - Chennai',                   'PV'),
+        ('CJB1',        'IL - TN Amazon',                   'Amazon'),
+        ('Container',   'ILWH - TN MP',                    'MP WH'),
+        ('DH',          'ILS - Delhi',                     'PV'),
+        ('Domestic',    'ILWH - TN MP',                    'MP WH'),
+        ('Export%',     'ILWH - Overseas',                 'Export'),
+        ('FG Godown',   'ILWH - TN MP (TP)',               'MP WH'),
+        ('FGA',         'IL - TN Amazon',                   'Amazon'),
+        ('GAR',         'IL - TN Old MP Garments',         'OLD MP'),
+        ('HANMP',       'IL - TN Old MP Handicraft',       'OLD MP'),
+        ('IYC-Godown',  'ILS - TN Ashram',                 'PV'),
+        ('IYC-MS',      'ILS - TN Ashram',                 'PV'),
+        ('KSC',         'ILS - UP Kashi',                  'PV'),
+        ('KSS',         'ILS - UP Kashi',                  'PV'),
+        ('LKO',         'ILS - UP Lucknow',                'PV'),
+        ('MAA4',        'IL- MH Amazon',                   'Amazon'),
+        ('MIAL',        'ILS - Mumbai Airport',            'Airport'),
+        ('MP1',         'ILWH - TN MP (old)',              'MP WH'),
+        ('NAG',         'ILS - KA Ashram',                 'PV'),
+        ('NS',          'ILWH - TN MP (NP)',               'MP WH'),
+        ('PL',          'IL - TN MP Photoshoot',           'MP Photo'),
+        ('PRA',         'IL - TN Ashram Prasadam',         'TN Ashram Other'),
+        ('QCMain',      'ILWH - TN QC MP',                 'MP QC WH'),
+        ('QCStaging',   'ILWH - TN QC MP',                 'MP QC WH'),
+        ('RPR',         'ILS - Chhattisgarh Raipur',       'PV'),
+        ('SL',          'ILS - TN Salem',                  'PV'),
+        ('TP',          'IL - TN Ashram Temple production','TN Ashram Other'),
+        ('%/Putaway%', 'ILWH - TN MP',                    'MP WH'),
+        ('IYCS/%',      'ILS - TN Ashram',                 'PV'),
+        ('StockStaging/In%', 'ILWH - TN MP',               'MP WH')
+),
+filtered_locations AS (
+    SELECT 
+        sl.id,
+        sl.complete_name,
+        SPLIT_PART(sl.complete_name, '/', 1) AS prefix
+    FROM public.stock_location sl
+    WHERE sl.complete_name NOT ILIKE '%damage%'
+      AND sl.complete_name NOT ILIKE '%dmg%'
+      AND sl.complete_name NOT ILIKE '%Sample%'
+      AND sl.complete_name NOT ILIKE '%Rework%'
+      AND sl.complete_name NOT ILIKE 'QCSample%'
+      AND sl.complete_name NOT ILIKE '%/Consumption%'
+      AND sl.complete_name NOT ILIKE 'Partners/%'
+      AND sl.complete_name NOT ILIKE 'Physical Locations/%'
+      AND sl.complete_name NOT ILIKE 'Virtual Locations/%'
+      AND sl.complete_name NOT ILIKE 'QCReturns/%'
+      AND sl.complete_name NOT ILIKE '%Consumable%'
+      AND sl.complete_name NOT ILIKE '%Complements%'
+      AND sl.complete_name NOT ILIKE 'FG%'
+      AND sl.complete_name NOT ILIKE 'StockStaging/Ret%'
+      AND sl.complete_name NOT ILIKE 'StockStaging/Out%'
+      AND sl.complete_name NOT ILIKE 'StockStaging/All%'
+      AND sl.complete_name NOT ILIKE 'StockStaging/Pa%'
+      AND sl.complete_name NOT ILIKE 'StockStaging/AMZ%'
+)
+SELECT
+    pp.barcode AS "Barcode",
+    pp.default_code AS "Internal Reference",
+    sq.quantity AS "Inventoried Quantity",
+    fl.complete_name AS "Location",
+    COALESCE(lm.group_1, '') AS "Group 1",
+    COALESCE(lm.group_2, '') AS "Group 2",
+    spl.name AS "Lot/Serial Number",
+    CONCAT('[', pp.default_code, '] ', COALESCE(pt.name->>'en_US', pt.name::text)) AS "Product",
+    sq.reserved_quantity AS "Reserved Quantity",
+    COALESCE(uom.name->>'en_US', uom.name::text) AS "Unit of Measure",
+    sq.write_date::date AS "Last Updated Date"
+FROM public.stock_quant sq
+JOIN filtered_locations fl ON sq.location_id = fl.id
+JOIN public.product_product pp ON sq.product_id = pp.id
+JOIN public.product_template pt ON pp.product_tmpl_id = pt.id
+LEFT JOIN public.stock_lot spl ON sq.lot_id = spl.id
+LEFT JOIN public.uom_uom uom ON pt.uom_id = uom.id
+LEFT JOIN location_mapping lm 
+  ON fl.prefix = lm.loc_pattern OR fl.complete_name ILIKE lm.loc_pattern
+WHERE sq.quantity > 0
+  [[ AND {{location_filter}} ]]
+  [[ AND {{product_filter}} ]]
+  [[ AND {{date_filter}} ]]
+
+ORDER BY 
+    fl.complete_name ASC, 
+    pp.default_code ASC;
