@@ -1,0 +1,402 @@
+with date_config as (
+select 
+date_trunc('month', current_date)::date as end_date,
+(date_trunc('month', current_date) - interval '6 months')::date as start_6m,
+date_part('day', (date_trunc('month', current_date) + interval '1 month' - interval '1 day'))::numeric as days_current_month,
+(date_trunc('month', current_date)::date 
+ - (date_trunc('month', current_date) - interval '6 months')::date)::numeric as days_6m),
+
+sku_unique as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+max((pt.name #>> array['en_US'])::text) as product_name,
+max(coalesce(orig.mtkg_category_l1, norm.mtkg_category_l1)) as l1,
+max(coalesce(orig.abc, norm.abc)) as abc,
+max(coalesce(orig.target_month, norm.target_month)) as target_month
+from product_product pp
+join product_template pt on pp.product_tmpl_id = pt.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join mktg_pdt_category_map orig 
+on coalesce(pp_base.id, pp.id) = orig.product_id
+left join product_product pp_norm on
+orig.mtkg_category_l1 is null and public.normalize_sku(pp.default_code) = pp_norm.default_code
+left join mktg_pdt_category_map norm on
+orig.mtkg_category_l1 is null and pp_norm.id = norm.product_id
+where pt.type != 'service' and pp.active = true
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+location_filter as (
+select l.id
+from stock_location l
+where l.complete_name ilike any (array['%Domestic%', 'MP1/Stock','NS/Stock/Domestic','%Container/CONT-%'])
+and exists (
+select 1 from stock_warehouse w 
+where w.id = l.warehouse_id and w.name in ('FG Warehouse MP', 'FG Warehouse MP 1','FG Warehouse NS'))),
+
+location_filter_wpi as (
+select l.id
+from stock_location l
+where (
+l.complete_name ilike any (array['%Domestic%', 'MP1/Stock','NS/Stock/Domestic','%Container/CONT-%',
+'StockStaging/Inward', 'StockStaging/Putaway', 'QCStaging/Inward']))
+and exists (
+select 1 from stock_warehouse w 
+where w.id = l.warehouse_id and w.name in ('FG Warehouse MP', 'FG Warehouse MP 1','FG Warehouse NS'))),
+
+aggregated_stock as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sq.quantity) as current_qty
+from stock_quant sq
+join product_product pp on sq.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join location_filter lf on sq.location_id = lf.id
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+aggregated_stock_wpi as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sq.quantity) as current_qty_wpi
+from stock_quant sq
+join product_product pp on sq.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join location_filter_wpi lf on sq.location_id = lf.id
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+pi_responsible as (
+select distinct on (coalesce(pp_base.default_code, pp.default_code))
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+coalesce(rp.name, 'Unassigned') as responsible_user
+from stock_picking sp
+join stock_move sm on sm.picking_id = sp.id
+join product_product pp on sm.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join res_users ru on sp.user_id = ru.id
+left join res_partner rp on ru.partner_id = rp.id
+-- LOOK FOR OPEN/ACTIVE TRANSFERS INSTEAD OF COMPLETED ONES
+where sp.state in ('assigned', 'waiting', 'confirmed')
+and (
+sp.name ilike 'FG/PTQ%' -- Prioritize Putaway transfers explicitly
+or sp.state not in ('done', 'cancel'))
+order by coalesce(pp_base.default_code, pp.default_code), 
+case when sp.name ilike 'FG/PTQ%' then 1 else 2 end asc, -- Look at Putaway documents first
+sp.scheduled_date desc),
+
+pi_stock_split as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+-- BUCKET 1: PENDING FOR PUTAWAY
+sum(case 
+-- Rule 1: Everything under StockStaging/Inward is Putaway Pending
+when sl.complete_name ilike '%StockStaging/Inward%' then sq.quantity
+-- Rule 2: StockStaging/Putaway handled by the 3 specified warehouse users
+when sl.complete_name ilike '%StockStaging/Putaway%' 
+ and pr.responsible_user in ('Selvakumar Velusamy', 'Valarmathi Natarajan', 'Karthik Krishnan') then sq.quantity
+else 0 
+end) as qty_putaway_pending,
+
+-- BUCKET 2: QC PENDING
+sum(case 
+-- Rule 1: Everything under QCStaging/Inward is QC Pending
+when sl.complete_name ilike '%QCStaging/Inward%' then sq.quantity
+-- Rule 2: StockStaging/Putaway handled by ANYONE ELSE (or unassigned/null)
+when sl.complete_name ilike '%StockStaging/Putaway%' 
+and (pr.responsible_user not in ('Selvakumar Velusamy', 'Valarmathi Natarajan', 'Karthik Krishnan') 
+or pr.responsible_user is null) then sq.quantity
+else 0
+end) as qty_qc_pending
+from stock_quant sq
+join product_product pp on sq.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join stock_location sl on sq.location_id = sl.id
+left join pi_responsible pr on pr.base_sku = coalesce(pp_base.default_code, pp.default_code)
+where sl.complete_name ilike any (array['%StockStaging/Inward%', '%StockStaging/Putaway%', '%QCStaging/Inward%'])
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+sales_invoice as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sol.product_uom_qty) as total_sold_6m
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join crm_team t on so.team_id = t.id
+cross join date_config dc
+where so.state not in ('draft', 'cancel')
+and so.date_order >= dc.start_6m
+and so.date_order < dc.end_date
+and (
+case
+when position('Amazon Sales - MA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz MH'
+when position('Amazon Sales - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales CJB1- TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - TN - MAA4' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - KA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz KA'
+when position('Amazon Sales FBM - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz FBM'
+when position('Local Sales - MH' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('MIAL Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('E-Com' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when position('Ecom' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when (position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 or position('Local Sales' in (t.name #>> array['en_US'])::text) > 0) 
+and so.partner_id in (select id from res_partner where name = 'A P Exports') then 'A P Exports'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30307, 230462) then 'IL Europe'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30305, 216914) then 'IL UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 4953 then 'IF UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23980 then 'IF Australia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 132583 then 'IF Malaysia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23982 then 'IF Hong Kong'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 30303 then 'IF Canada'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 2006 then 'IF USA'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Yantra'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 
+and so.partner_id in (select id from res_partner where name in (
+'Isha Business Pvt Ltd', 'Isha Crafts Private Limited', 'Isha Design', 'Isha Education',
+'Isha Foundation', 'Isha Foundation - Delhi', 'Isha Foundation - Karnataka', 'Isha Home School',
+'Isha Institute of Inner Sciences', 'Isha Life Hyderabad Yoga Studio LLP', 'Isha Outreach',
+'Isha Outreach - Karnataka', 'Isha Sacred Walks', 'Isha Utsav', 'Sadhguru Academy',
+'Sadhguru Academy - KA', 'Shri Yogini Trust', 'Thenkailaya Bakthi Peravai'
+)) then 'Isha Entities'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 then 'B2B Vira'
+else (t.name #>> array['en_US'])::text
+end is not null)
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+sales_pos as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(pol.qty) as total_sold_6m
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join account_journal aj on po.sale_journal = aj.id
+cross join date_config dc
+where po.state in ('done', 'invoiced', 'paid')
+and po.date_order >= dc.start_6m
+and po.date_order < dc.end_date
+and (aj.name #>> '{}')::text ilike any (array[
+'%TN Point of Sale%',
+'%CG Point of Sale%',
+'%PY Point of Sale%',
+'%KA Point of Sale%',
+'%UP Point of Sale%',
+'%DH Point of Sale%'])
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+aggregated_sales as (
+select base_sku, sum(total_sold_6m) as total_sold_6m
+from (
+select * from sales_invoice
+union all
+select * from sales_pos) t
+group by base_sku),
+
+aggregated_price as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+coalesce(sum(sol.price_subtotal) / nullif(sum(sol.product_uom_qty), 0), 0) as avg_selling_price
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join crm_team t on so.team_id = t.id
+cross join date_config dc
+where so.state not in ('draft', 'cancel')
+and so.date_order >= dc.start_6m
+and so.date_order < dc.end_date
+and (
+case
+when position('Amazon Sales - MA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz MH'
+when position('Amazon Sales - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales CJB1- TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - TN - MAA4' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - KA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz KA'
+when position('Amazon Sales FBM - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz FBM'
+when position('Local Sales - MH' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('MIAL Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('E-Com' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when position('Ecom' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when (position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 or position('Local Sales' in (t.name #>> array['en_US'])::text) > 0) 
+and so.partner_id in (select id from res_partner where name = 'A P Exports') then 'A P Exports'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30307, 230462) then 'IL Europe'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30305, 216914) then 'IL UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 4953 then 'IF UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23980 then 'IF Australia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 132583 then 'IF Malaysia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23982 then 'IF Hong Kong'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 30303 then 'IF Canada'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 2006 then 'IF USA'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Yantra'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 
+and so.partner_id in (select id from res_partner where name in (
+'Isha Business Pvt Ltd', 'Isha Crafts Private Limited', 'Isha Design', 'Isha Education',
+'Isha Foundation', 'Isha Foundation - Delhi', 'Isha Foundation - Karnataka', 'Isha Home School',
+'Isha Institute of Inner Sciences', 'Isha Life Hyderabad Yoga Studio LLP', 'Isha Outreach',
+'Isha Outreach - Karnataka', 'Isha Sacred Walks', 'Isha Utsav', 'Sadhguru Academy',
+'Sadhguru Academy - KA', 'Shri Yogini Trust', 'Thenkailaya Bakthi Peravai'
+)) then 'Isha Entities'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 then 'B2B Vira'
+else (t.name #>> array['en_US'])::text
+end is not null)
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+aggregated_price_3y as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+coalesce(sum(sol.price_subtotal) / nullif(sum(sol.product_uom_qty), 0), 0) as avg_selling_price_3y
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join crm_team t on so.team_id = t.id
+where so.state not in ('draft',  'cancel')
+and so.date_order >= date_trunc('month', current_date) - interval '3 years'
+and so.date_order < date_trunc('month', current_date)::date
+and (
+case
+when position('Amazon Sales - MA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz MH'
+when position('Amazon Sales - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales CJB1- TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - TN - MAA4' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - KA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz KA'
+when position('Amazon Sales FBM - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz FBM'
+when position('Local Sales - MH' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('MIAL Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('E-Com' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when position('Ecom' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when (position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 or position('Local Sales' in (t.name #>> array['en_US'])::text) > 0) 
+and so.partner_id in (select id from res_partner where name = 'A P Exports') then 'A P Exports'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30307, 230462) then 'IL Europe'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30305, 216914) then 'IL UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 4953 then 'IF UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23980 then 'IF Australia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 132583 then 'IF Malaysia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23982 then 'IF Hong Kong'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 30303 then 'IF Canada'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 2006 then 'IF USA'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Yantra'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 
+and so.partner_id in (select id from res_partner where name in (
+'Isha Business Pvt Ltd', 'Isha Crafts Private Limited', 'Isha Design', 'Isha Education',
+'Isha Foundation', 'Isha Foundation - Delhi', 'Isha Foundation - Karnataka', 'Isha Home School',
+'Isha Institute of Inner Sciences', 'Isha Life Hyderabad Yoga Studio LLP', 'Isha Outreach',
+'Isha Outreach - Karnataka', 'Isha Sacred Walks', 'Isha Utsav', 'Sadhguru Academy',
+'Sadhguru Academy - KA', 'Shri Yogini Trust', 'Thenkailaya Bakthi Peravai'
+)) then 'Isha Entities'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 then 'B2B Vira'
+else (t.name #>> array['en_US'])::text
+end is not null)
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+prepared as (
+select
+su.base_sku,
+su.product_name,
+su.l1,
+su.abc as abc_classification,
+su.target_month as target_month,
+coalesce(ast.current_qty, 0) as qty,
+coalesce(ast_wpi.current_qty_wpi, 0) - coalesce(ast.current_qty, 0) as qty_pi,
+coalesce(ast_wpi.current_qty_wpi, 0) as qty_wpi,
+coalesce(pss.qty_putaway_pending, 0) as qty_putaway_pending,
+coalesce(pss.qty_qc_pending, 0) as qty_qc_pending,
+coalesce(als.total_sold_6m, 0) as total_sold_6m,
+coalesce(pr.avg_selling_price, 0) as avg_selling_price,
+coalesce(pr3y.avg_selling_price_3y, 0) as avg_selling_price_3y,
+dc.days_6m,
+dc.days_current_month
+from sku_unique su
+cross join date_config dc
+left join aggregated_stock ast on su.base_sku = ast.base_sku
+left join aggregated_stock_wpi ast_wpi on su.base_sku = ast_wpi.base_sku
+left join pi_stock_split pss on su.base_sku = pss.base_sku
+left join aggregated_sales als on su.base_sku = als.base_sku
+left join aggregated_price pr on su.base_sku = pr.base_sku
+left join aggregated_price_3y pr3y on su.base_sku = pr3y.base_sku
+where coalesce(ast.current_qty, 0) != 0 
+or coalesce(als.total_sold_6m, 0) != 0)
+
+select *,
+case
+when "Stock Index" = 0  then 'OOS'
+when "Stock Index" > 0 and "Stock Index" <= 0.3 then '0-30%'
+when "Stock Index" > 0.3  and "Stock Index" <= 0.5 then '30-50%'
+when "Stock Index" > 0.5  and "Stock Index" <= 0.8 then '50-80%'
+when "Stock Index" > 0.8  and "Stock Index" <= 1   then '80-100%'
+when "Stock Index" > 1 and "Stock Index" <= 1.2 then '100-120%'
+when "Stock Index" > 1.2  and "Stock Index" <= 1.5 then '120-150%'
+when "Stock Index" > 1.5   then '>150%'
+end as "Stock Index Bucket"
+from (
+select
+product_name as "Product",
+base_sku as "SKU",
+l1 as "Category L1",
+abc_classification as "ABC Classification",
+round(avg_selling_price, 1) as "Avg Selling Price",
+qty as "SOH",
+qty_pi as "PI SOH",
+qty_putaway_pending as "Pending for Putaway",
+qty_qc_pending as "QC Pending",
+round(case when days_6m > 0 then total_sold_6m / days_6m else 0 end) as "Daily Avg Sales QTY",
+round(qty / nullif(case when days_6m > 0 then total_sold_6m / days_6m else 0 end, 0), 0) as "Days Coverage",
+round(qty / nullif((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month, 0), 1) as "Month Coverage",
+target_month as "Target Month Coverage",
+round((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month, 0) as "6M Avg Sales (Units/ Month)",
+round(least(qty, (case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month), 0) as "Coverage basis P6M Avg (Units)",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month - qty, 0), 0) as "Shortage (Units)",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month * 1.5 - qty, 0), 0) as "Shortage to 1.5M (Units)",
+round(((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price, 0) as "6M Avg Sales (INR)",
+round(least(qty, (case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price, 0) as "Coverage basis P6M Avg (INR)",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month - qty, 0) * avg_selling_price, 0) as "Shortage (INR)",
+round(avg_selling_price_3y, 1) as "3Y Avg Selling Price",
+round(coalesce(nullif(avg_selling_price_3y, 0), avg_selling_price) * qty) as "Total Value (INR@SP)",
+round(coalesce(nullif(avg_selling_price_3y, 0), avg_selling_price) * qty_pi) as "PI - Total Value (INR@SP)",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month * 1.5 - qty, 0) * avg_selling_price, 0) as "Shortage to 1.5M (INR)",
+concat(round(
+(least(qty, (case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price 
+ / nullif(((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price, 0)) * 100,
+1), '%') as "CFR",
+qty_wpi as "wPI SOH",
+round(qty_wpi / nullif(case when days_6m > 0 then total_sold_6m / days_6m else 0 end, 0), 0) 
+as "wPI Days Coverage",
+round(qty_wpi / nullif((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month, 0), 1) 
+as "wPI Month Coverage",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month - qty_wpi, 0), 0) 
+as "wPI Shortage (Units)",
+round(greatest((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month - qty_wpi, 0) * avg_selling_price, 0) 
+as "wPI Shortage (INR)",
+round(least(qty_wpi, (case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price, 0) 
+as "wPI Coverage basis P6M Avg (INR)",
+concat(round(
+(least(qty_wpi, (case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price 
+ / nullif(((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month) * avg_selling_price, 0)) * 100,
+1), '%') as "wPI CFR",
+round(qty / nullif((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month, 0), 1) / nullif(target_month, 0) as "Stock Index",
+round(greatest(
+(target_month - coalesce(qty_wpi / nullif((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month, 0), 0)) 
+* ((case when days_6m > 0 then total_sold_6m / days_6m else 0 end) * days_current_month), 
+0)::numeric, 0) as "Gap to T.SOH"
+
+from prepared
+where base_sku not like '%-IN' and base_sku not like '%old') t
+order by "Daily Avg Sales QTY" desc nulls last, "Days Coverage" asc nulls last;
