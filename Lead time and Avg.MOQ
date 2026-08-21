@@ -1,0 +1,50 @@
+SELECT 
+    po.name AS purchase_order_number,
+    sp.name AS receipt_number,
+    rp.name AS vendor_name,
+    COALESCE(pt.name->>'en_US', pt.name::text) AS product_name,
+    pp.default_code AS internal_reference,
+    po.date_order AS po_created_date,
+    sp.date_done AS material_received_date,
+    pol.product_qty AS ordered_qty,
+    sm.product_uom_qty AS received_qty,
+    ROUND(
+        (EXTRACT(EPOCH FROM (sp.date_done - po.date_order)) / 86400.0)::numeric, 
+        2
+    ) AS specific_lead_days,
+    ROUND(
+        AVG(EXTRACT(EPOCH FROM (sp.date_done - po.date_order)) / 86400.0) 
+        OVER(PARTITION BY pp.id)::numeric, 
+        2
+    ) AS product_avg_lead_days,
+
+    ROUND(
+        AVG(pol.product_qty) 
+        OVER(PARTITION BY pp.id)::numeric, 
+        2
+    ) AS product_avg_ordered_qty,
+
+    ROUND(
+        AVG(sm.product_uom_qty) 
+        OVER(PARTITION BY pp.id)::numeric, 
+        2
+    ) AS product_avg_received_qty
+
+FROM purchase_order_line pol
+JOIN purchase_order po ON pol.order_id = po.id
+JOIN res_partner rp ON po.partner_id = rp.id
+JOIN product_product pp ON pol.product_id = pp.id
+JOIN product_template pt ON pp.product_tmpl_id = pt.id
+JOIN stock_move sm ON sm.purchase_line_id = pol.id
+JOIN stock_picking sp ON sm.picking_id = sp.id
+JOIN stock_picking_type spt ON sp.picking_type_id = spt.id
+
+WHERE 
+    po.state IN ('purchase', 'done')
+    AND sp.state = 'done'
+    AND spt.code = 'incoming'
+    AND sp.date_done IS NOT NULL
+    AND po.date_order IS NOT NULL
+    AND rp.name NOT ILIKE '%Isha Life Pvt Ltd%' 
+
+ORDER BY sp.date_done DESC,pp.default_code Asc;
