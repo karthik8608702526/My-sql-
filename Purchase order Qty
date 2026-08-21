@@ -1,0 +1,94 @@
+SELECT 
+    *,
+    CASE 
+        WHEN net_difference_qty != 0 THEN 'Yes' 
+        ELSE 'No' 
+    END AS receipt_done_bill_not_raised
+FROM (
+    SELECT 
+        purchase_order.name AS purchase_order_name,
+        res_company.name AS company,
+        purchase_order.date_order AS Date,
+        receipt_data.last_validation_date AS receipt_validation_date,
+        product_product.default_code AS sku,
+        (product_template.name #>> array['en_US'])::text AS "Product",
+        purchase_order_line.product_qty AS Qty_Ordered,
+        purchase_order_line.qty_received AS Qty_received,
+        purchase_order_line.qty_invoiced AS Qty_invoiced,
+        COALESCE(posted_inv.total_posted_qty, 0) AS invoice_posted_qty,
+        COALESCE(debit_notes.total_debit_qty, 0) AS debit_note_qty,
+        (COALESCE(posted_inv.total_posted_qty, 0) - COALESCE(debit_notes.total_debit_qty, 0)) AS net_posted_qty,
+        (purchase_order_line.qty_received - (COALESCE(posted_inv.total_posted_qty, 0) - COALESCE(debit_notes.total_debit_qty, 0))) AS net_difference_qty,
+        purchase_order.invoice_status AS billing_status,
+        purchase_order.receipt_status AS receipt_status,
+        purchase_order.state AS purchase_state
+    FROM 
+        purchase_order
+    JOIN 
+        purchase_order_line ON purchase_order_line.order_id = purchase_order.id
+    LEFT JOIN 
+        res_company ON res_company.id = purchase_order.company_id    
+    LEFT JOIN 
+        product_product ON purchase_order_line.product_id = product_product.id
+    LEFT JOIN 
+        product_template ON product_template.id = product_product.product_tmpl_id
+    -- Join to Stock Picking to allow Metabase to "see" the table for filters
+    LEFT JOIN (
+        SELECT 
+            sm.purchase_line_id, 
+            MAX(sp.date_done) as last_validation_date
+        FROM stock_move sm
+        JOIN stock_picking sp ON sp.id = sm.picking_id
+        WHERE sp.state = 'done'
+        GROUP BY sm.purchase_line_id
+    ) receipt_data ON receipt_data.purchase_line_id = purchase_order_line.id
+    -- We join stock_picking again WITHOUT an alias specifically for the Metabase Field Filter
+    LEFT JOIN stock_move ON stock_move.purchase_line_id = purchase_order_line.id
+    LEFT JOIN stock_picking ON stock_picking.id = stock_move.picking_id
+    
+    LEFT JOIN (
+        SELECT 
+            aml.purchase_line_id, 
+            SUM(aml.quantity) AS total_posted_qty
+        FROM 
+            account_move_line aml
+        JOIN 
+            account_move am ON am.id = aml.move_id
+        WHERE 
+            am.state = 'posted' 
+            AND am.move_type = 'in_invoice'
+        GROUP BY 
+            aml.purchase_line_id
+    ) posted_inv ON posted_inv.purchase_line_id = purchase_order_line.id
+    LEFT JOIN (
+        SELECT 
+            aml.purchase_line_id, 
+            SUM(aml.quantity) AS total_debit_qty
+        FROM 
+            account_move_line aml
+        JOIN 
+            account_move am ON am.id = aml.move_id
+        WHERE 
+            am.state = 'posted' 
+            AND am.move_type = 'in_refund'
+        GROUP BY 
+            aml.purchase_line_id
+    ) debit_notes ON debit_notes.purchase_line_id = purchase_order_line.id
+    WHERE 
+        (purchase_order.state IN ('purchase', 'done') AND (product_template.detailed_type = 'product' OR product_template.detailed_type IS NULL))
+        
+        -- METABASE FIELD FILTERS
+        [[AND {{company_filter}}]]
+        [[AND {{date_filter}}]]
+        [[AND {{sku_filter}}]]
+        [[AND {{purchase_order_name}}]]
+        [[AND {{receipt_date_filter}}]] -- Map this to stock_picking.date_done
+        
+) AS final_report
+WHERE 1=1
+    [[AND (CASE WHEN net_difference_qty != 0 THEN 'Yes' ELSE 'No' END) = {{receipt_status_logic}}]]
+-- Adding group by to prevent duplicates from the extra stock_move join
+GROUP BY 
+    purchase_order_name, company, Date, receipt_validation_date, sku, "Product", 
+    Qty_Ordered, Qty_received, Qty_invoiced, invoice_posted_qty, debit_note_qty, 
+    net_posted_qty, net_difference_qty, billing_status, receipt_status, purchase_state
