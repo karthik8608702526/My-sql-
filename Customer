@@ -1,0 +1,83 @@
+WITH customer_base AS (
+    SELECT 
+        p.id AS customer_id,
+        p.name AS customer_name,
+        st.name AS region,
+        STRING_AGG(
+            DISTINCT COALESCE(
+                CASE WHEN pc.name::text ILIKE '{%' THEN pc.name::jsonb->>'en_US' ELSE pc.name::text END,
+                CASE WHEN w.name::text ILIKE '{%' THEN w.name::jsonb->>'en_US' ELSE w.name::text END,
+                CASE WHEN crm_team.name::text ILIKE '{%' THEN crm_team.name::jsonb->>'en_US' ELSE crm_team.name::text END,
+                CASE WHEN so.amazon_channel::text ILIKE '{%' THEN so.amazon_channel::jsonb->>'en_US' ELSE so.amazon_channel::text END,
+                CASE WHEN m.name::text ILIKE '{%' THEN m.name::jsonb->>'en_US' ELSE m.name::text END,
+                CASE WHEN src.name::text ILIKE '{%' THEN src.name::jsonb->>'en_US' ELSE src.name::text END
+            ), ', '
+        ) AS channel,
+        STRING_AGG(
+            DISTINCT COALESCE(
+                CASE WHEN res_partner_category.name::text ILIKE '{%' THEN res_partner_category.name::jsonb->>'en_US' ELSE res_partner_category.name::text END
+            ), ', '
+        ) AS segment,
+        -- Calculate total revenue for the last 6 months across Sale Orders and POS Orders
+        COALESCE(SUM(DISTINCT CASE WHEN so.date_order >= CURRENT_DATE - INTERVAL '6 months' THEN so.amount_total ELSE 0 END), 0) + 
+        COALESCE(SUM(DISTINCT CASE WHEN po.date_order >= CURRENT_DATE - INTERVAL '6 months' THEN po.amount_total ELSE 0 END), 0) AS total_revenue_last_6m
+    FROM 
+        res_partner p
+    LEFT JOIN 
+        res_country_state st ON p.state_id = st.id
+    LEFT JOIN 
+        sale_order so ON p.id = so.partner_id 
+            AND so.date_order >= CURRENT_DATE - INTERVAL '6 months'
+            AND so.state IN ('sale', 'done')
+    LEFT JOIN 
+        website w ON so.website_id = w.id
+    LEFT JOIN 
+        crm_team ON so.team_id = crm_team.id
+    LEFT JOIN 
+        utm_medium m ON so.medium_id = m.id
+    LEFT JOIN 
+        utm_source src ON so.source_id = src.id
+    LEFT JOIN 
+        pos_order po ON p.id = po.partner_id 
+            AND po.date_order >= CURRENT_DATE - INTERVAL '6 months'
+            AND po.state IN ('paid', 'done', 'invoiced')
+    LEFT JOIN 
+        pos_session ps ON po.session_id = ps.id
+    LEFT JOIN 
+        pos_config pc ON ps.config_id = pc.id
+    LEFT JOIN 
+        res_partner_res_partner_category_rel rel ON p.id = rel.partner_id
+    LEFT JOIN 
+        res_partner_category ON rel.category_id = res_partner_category.id
+    WHERE 
+        p.customer_rank > 0
+        [[ AND {{channel_filter}} ]]
+        [[ AND {{segment_filter}} ]]
+        AND (so.date_order >= CURRENT_DATE - INTERVAL '6 months' OR po.date_order >= CURRENT_DATE - INTERVAL '6 months')
+    GROUP BY 
+        p.id, 
+        p.name, 
+        st.name
+),
+customer_ranked AS (
+    SELECT 
+        *,
+        -- Percentile ranking ordered highest revenue first
+        PERCENT_RANK() OVER (ORDER BY total_revenue_last_6m DESC) AS rev_percentile
+    FROM customer_base
+)
+SELECT 
+    customer_id,
+    customer_name,
+    channel,
+    region,
+    total_revenue_last_6m,
+    CASE 
+        WHEN rev_percentile <= 0.50 THEN 'A+'   -- Top 50%
+        WHEN rev_percentile <= 0.80 THEN 'A'    -- Next 30%
+        WHEN rev_percentile <= 0.95 THEN 'B'    -- Next 15%
+        ELSE 'C'                                -- Remaining 5%
+    END AS classification
+FROM customer_ranked
+-- Primary sort: Highest revenue first; Secondary sort: Customer ID
+ORDER BY total_revenue_last_6m DESC, customer_id ASC;
