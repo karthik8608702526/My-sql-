@@ -1,0 +1,127 @@
+WITH orders AS (
+    SELECT
+        sale_order.id,
+        sale_order.name,
+        sale_order.date_order,
+        sale_order.create_date,
+        sale_order.amount_total AS order_value
+    FROM sale_order
+    JOIN crm_team ON crm_team.id = sale_order.team_id
+    WHERE LOWER(crm_team.name->>'en_US') LIKE '%ecom sale%'
+      AND sale_order.state NOT IN ('cancel', 'draft')
+      AND {{order_date}}
+),
+-- all relevant pickings for those orders (indexed sale_id + origin fallback)
+so_pickings AS (
+    SELECT
+        o.id AS order_id,
+        o.name AS sale_order,
+        o.date_order,
+        o.create_date,
+        o.order_value,
+        sp.id AS picking_id,
+        sp.name AS delivery_order,
+        sp.carrier_tracking_ref AS awb,
+        sp.courier_name,
+        spt.code,
+        sp.date_done,
+        sp.actual_delivery_date,
+        sp.api_state,
+        sp.tracking_status
+    FROM orders o
+    JOIN stock_picking sp ON sp.sale_id = o.id
+    JOIN stock_picking_type spt ON spt.id = sp.picking_type_id
+    WHERE sp.state = 'done'
+      AND spt.code IN ('internal', 'outgoing')
+
+    UNION ALL
+
+    SELECT
+        o.id,
+        o.name,
+        o.date_order,
+        o.create_date,
+        o.order_value,
+        sp.id,
+        sp.name,
+        sp.carrier_tracking_ref,
+        sp.courier_name,
+        spt.code,
+        sp.date_done,
+        sp.actual_delivery_date,
+        sp.api_state,
+        sp.tracking_status
+    FROM orders o
+    JOIN stock_picking sp ON sp.origin = o.name
+    JOIN stock_picking_type spt ON spt.id = sp.picking_type_id
+    WHERE sp.sale_id IS NULL
+      AND sp.state = 'done'
+      AND spt.code IN ('internal', 'outgoing')
+),
+-- pick done is warehouse pick for the order (shared upstream step)
+pick AS (
+    SELECT
+        order_id,
+        MIN(date_done) AS pick_done_at
+    FROM so_pickings
+    WHERE code = 'internal'
+    GROUP BY order_id
+),
+-- one row per outgoing delivery (each AWB)
+deliveries AS (
+    SELECT *
+    FROM so_pickings
+    WHERE code = 'outgoing'
+),
+-- dispatch time per delivery picking (package left warehouse)
+dispatch AS (
+    SELECT
+        sml.picking_id,
+        MIN(spkg.dispatched_on) AS dispatched_at
+    FROM stock_move_line sml
+    JOIN stock_quant_package spkg ON spkg.id = sml.result_package_id
+    WHERE sml.picking_id IN (SELECT picking_id FROM deliveries)
+      AND spkg.package_status = 'dispatched'
+      AND spkg.dispatched_on IS NOT NULL
+    GROUP BY sml.picking_id
+)
+SELECT
+    d.sale_order,
+    d.delivery_order,
+    d.awb,
+    d.courier_name,
+    d.order_value,
+    d.date_order AS order_created,
+    p.pick_done_at,
+    d.date_done AS packed_at,
+    x.dispatched_at,
+    d.actual_delivery_date AS delivered_on,
+    d.api_state,
+    d.tracking_status,
+
+    ROUND(EXTRACT(EPOCH FROM (p.pick_done_at - d.create_date)) / 3600.0, 2)
+        AS hrs_create_to_pick,
+    ROUND(EXTRACT(EPOCH FROM (d.date_done - p.pick_done_at)) / 3600.0, 2)
+        AS hrs_pick_to_packed,
+    ROUND(EXTRACT(EPOCH FROM (x.dispatched_at - d.date_done)) / 3600.0, 2)
+        AS hrs_packed_to_dispatch,
+    ROUND(EXTRACT(EPOCH FROM (x.dispatched_at - d.create_date)) / 3600.0, 2)
+        AS hrs_create_to_dispatch,
+
+    -- this AWB / this delivery only
+    CASE
+        WHEN d.actual_delivery_date IS NOT NULL
+        THEN ROUND(EXTRACT(EPOCH FROM (d.actual_delivery_date::timestamp - d.create_date)) / 3600.0, 2)
+    END AS hrs_create_to_customer,
+    CASE
+        WHEN d.actual_delivery_date IS NOT NULL AND x.dispatched_at IS NOT NULL
+        THEN ROUND(EXTRACT(EPOCH FROM (d.actual_delivery_date::timestamp - x.dispatched_at)) / 3600.0, 2)
+    END AS hrs_dispatch_to_customer,
+    CASE
+        WHEN d.actual_delivery_date IS NOT NULL AND d.date_done IS NOT NULL
+        THEN ROUND(EXTRACT(EPOCH FROM (d.actual_delivery_date::timestamp - d.date_done)) / 3600.0, 2)
+    END AS hrs_packed_to_customer
+FROM deliveries d
+LEFT JOIN pick p ON p.order_id = d.order_id
+LEFT JOIN dispatch x ON x.picking_id = d.picking_id
+ORDER BY d.date_order DESC, d.delivery_order;
