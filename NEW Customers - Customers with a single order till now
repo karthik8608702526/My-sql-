@@ -1,0 +1,31 @@
+WITH ecom AS (
+    SELECT
+        sale_order.id,
+        sale_order.name,
+        sale_order.date_order,
+        sale_order.amount_total AS order_value,
+        COALESCE(rp.commercial_partner_id, rp.id) AS customer_id
+    FROM sale_order
+    JOIN crm_team ON crm_team.id = sale_order.team_id
+    JOIN res_partner rp ON rp.id = sale_order.partner_id
+    WHERE LOWER(crm_team.name->>'en_US') LIKE '%ecom sale%'
+      AND sale_order.state NOT IN ('cancel', 'draft')
+),
+single_customers AS (
+    SELECT customer_id
+    FROM ecom
+    GROUP BY customer_id
+    HAVING COUNT(*) = 1
+)
+SELECT
+    e.customer_id AS partner_id,
+    rp.name AS customer,
+    rp.email,
+    rp.phone,
+    e.name AS only_order,
+    e.date_order,
+    e.order_value
+FROM ecom e
+JOIN single_customers sc ON sc.customer_id = e.customer_id
+JOIN res_partner rp ON rp.id = e.customer_id
+ORDER BY e.date_order DESC;
