@@ -1,0 +1,109 @@
+SELECT
+    po.name                                   AS "Purchase order number",
+    vendor.name                               AS "Vendor Name",
+    po.date_planned                           AS "Expected Arrival",
+
+    -- Purchase order line
+    pp.default_code                           AS "Purchase Product",
+    ("pt"."name" #>> array['en_US'])::text AS "Purchase Product Description",
+    pol.product_qty                           AS "Purchase Quantity",
+    pol.price_unit                            AS "Unit price",
+    pt.l10n_in_hsn_code                       AS "Purchase HSN",
+    pol.discount                              AS "Purchase Discount",
+    pol.price_subtotal                        AS "Untaxed Amount",
+    COALESCE(pol.price_total - pol.price_subtotal, 0) AS "Tax Amount",
+    pol.price_total                           AS "Total Amount",
+
+    -- Receipt
+    sp.name                                   AS "Receipt Note Reference",
+    dest_loc.complete_name                    AS "Destination Location",
+    ("pt_rec"."name" #>> array['en_US'])::text AS "Receipt Product",
+    sm.product_uom_qty                        AS "Receipt Demand Quantity",
+    sp.state                                  AS "Receipt Status",
+
+    -- Vendor (bill side – same partner as PO, usually)
+    vendor.name                               AS "Vendor Name (Bill)",
+    COALESCE(
+        vendor.street || ', ' || vendor.city || ', ' || vendor.state_id::text,
+        vendor.street
+    )                                         AS "Vendor Address",
+
+    -- Vendor bill header (account_move)
+    bill.name                                 AS "Vendor Bill reference",
+    bill.invoice_origin                       AS "Bill Reference",
+    bill.invoice_date                         AS "Bill Date",
+    bill.date                                 AS "Accounting Date",
+    pt_term.name                              AS "Payment Term",
+    bill.payment_reference                    AS "Payment Reference",
+
+    -- Vendor bill line (account_move_line)
+    aml.product_id                            AS "Product (ID)",
+    ("pt_aml"."name" #>> array['en_US'])::text AS "Product Description",
+    aml.name                                  AS "Product Description(Label)",
+    acc.code || ' - ' || ("acc"."name" #>> array['en_US'])::text AS "Account",
+    aml.analytic_distribution                 AS "Analytic Distribution (Inv)",
+    aml.quantity                              AS "Quantity",
+    ("uom_aml"."name" #>> array['en_US'])::text AS "UOM",
+    aml.price_unit                            AS "Price",
+    aml.discount                              AS "Discount",
+    aml.price_subtotal                        AS "Tax Excl",
+    aml.price_total                           AS "Tax Incl",
+    aml.balance                               AS "Total Amount (Inv)"
+
+FROM purchase_order po
+    -- Vendor on PO
+    LEFT JOIN res_partner vendor
+           ON vendor.id = po.partner_id
+
+    -- Purchase order lines
+    LEFT JOIN purchase_order_line pol
+           ON pol.order_id = po.id
+    LEFT JOIN product_product pp
+           ON pp.id = pol.product_id
+    LEFT JOIN product_template pt
+           ON pt.id = pp.product_tmpl_id
+
+    -- Receipt side
+    LEFT JOIN stock_picking sp
+           ON sp.origin = po.name
+    LEFT JOIN stock_location dest_loc
+           ON dest_loc.id = sp.location_dest_id
+    LEFT JOIN stock_move sm
+           ON sm.picking_id = sp.id
+          AND sm.purchase_line_id = pol.id
+    LEFT JOIN product_product pp_rec
+           ON pp_rec.id = sm.product_id
+    LEFT JOIN product_template pt_rec
+           ON pt_rec.id = pp_rec.product_tmpl_id
+
+    ------------------------------------------------------------------
+    -- 🔗 MAIN LINK: PO line → vendor bill line
+    -- account_move_line.purchase_line_id points to purchase_order_line.id
+    ------------------------------------------------------------------
+    LEFT JOIN account_move_line aml
+           ON aml.purchase_line_id = pol.id
+
+    -- From the bill line, get the bill header
+    LEFT JOIN account_move bill
+           ON bill.id = aml.move_id
+          AND bill.move_type = 'in_invoice'
+          AND bill.state != 'cancel'
+          AND bill.company_id = po.company_id
+
+    -- Payment term of that bill
+    LEFT JOIN account_payment_term pt_term
+           ON pt_term.id = bill.invoice_payment_term_id
+
+    -- Product / UOM / account of invoice line
+    LEFT JOIN product_product pp_aml
+           ON pp_aml.id = aml.product_id
+    LEFT JOIN product_template pt_aml
+           ON pt_aml.id = pp_aml.product_tmpl_id
+    LEFT JOIN uom_uom uom_aml
+           ON uom_aml.id = aml.product_uom_id
+    LEFT JOIN account_account acc
+           ON acc.id = aml.account_id
+    LEFT JOIN LATERAL jsonb_each_text(aml.analytic_distribution) ad
+       ON true
+    LEFT JOIN account_analytic_account aaa
+           ON aaa.id = ad.key::int
