@@ -1,0 +1,45 @@
+SELECT
+  CASE
+    WHEN aml.id IS NULL THEN 'Missing'
+    WHEN sm.quantity != aml.quantity THEN 'Mismatched'
+    ELSE 'Matched'
+  END AS quantity_match_status,
+  po.name AS purchase_order_name,
+  sm.id AS move_id,
+  sp.id AS picking_id,
+  sp.name AS picking_name,
+  ("smpt"."name" #>> array['en_US']) :: text AS "SM Product",
+  sm.product_id AS sm_product_id,
+  sm.quantity AS sm_qty,
+  sp.origin AS origin,
+  sp.state AS picking_state,
+  am.id AS debit_note_id,
+  am.name AS debit_note,
+  aml.product_id AS aml_product_id,
+  ("ampt"."name" #>> array['en_US']) :: text AS "AM Product",
+  aml.quantity AS aml_qty,
+  am.state AS am_state
+FROM
+  purchase_order_line pol
+  INNER JOIN purchase_order po ON pol.order_id = po.id
+  LEFT JOIN stock_move sm ON sm.purchase_line_id = pol.id
+  LEFT JOIN stock_picking sp ON sp.id = sm.picking_id
+  LEFT JOIN stock_picking_type spt ON spt.id = sp.picking_type_id
+  LEFT JOIN account_move_line aml ON aml.purchase_line_id = pol.id AND aml.product_id = sm.product_id
+  LEFT JOIN account_move am ON am.id = aml.move_id
+  JOIN product_product smpp ON sm.product_id = smpp.id
+  JOIN product_template smpt ON smpp.product_tmpl_id = smpt.id
+  LEFT JOIN product_product ampp ON aml.product_id = ampp.id
+  LEFT JOIN product_template ampt ON ampp.product_tmpl_id = ampt.id
+WHERE
+  po.state = 'purchase'
+  AND sm.state = 'done'
+  AND sp.state = 'done'
+  AND sp.return_id IS NOT NULL
+  AND spt.code = 'outgoing'
+  AND (am.reversed_entry_id IS NOT NULL OR am.id IS NULL)
+  AND (am.state = 'posted' OR am.id IS NULL)
+--   AND po.name IN ('P03096', 'P00405', 'P00366')
+ORDER BY
+  po.name,
+  sp.name;
