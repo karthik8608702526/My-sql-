@@ -1,0 +1,477 @@
+with date_config as (
+select 
+date_trunc('month', current_date)::date as end_date,
+(date_trunc('month', current_date) - interval '3 months')::date as start_3m,
+date_part('day', (date_trunc('month', current_date) + interval '1 month' - interval '1 day'))::numeric as days_current_month,
+(date_trunc('month', current_date)::date 
+- (date_trunc('month', current_date) - interval '3 months')::date)::numeric as days_3m),
+
+sku_unique as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+max((pt.name #>> array['en_US'])::text) as product_name,
+max(coalesce(orig.mtkg_category_l1, norm.mtkg_category_l1)) as l1,
+max(coalesce(orig.abc, norm.abc)) as abc
+from product_product pp
+join product_template pt on pp.product_tmpl_id = pt.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join mktg_pdt_category_map orig on pp.id = orig.product_id
+left join product_product pp_norm on
+orig.mtkg_category_l1 is null and public.normalize_sku(pp.default_code) = pp_norm.default_code
+left join mktg_pdt_category_map norm on
+orig.mtkg_category_l1 is null and pp_norm.id = norm.product_id
+where pt.type != 'service' and pp.active = true
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+location_filter as (
+select l.id
+from stock_location l
+where l.complete_name ilike any (array['ILS-Godown/C01-L','ILS-Godown/C01-R',
+'ILS-Godown/C02-R','ILS-Godown/MG-F01',
+'ILS-Godown/MG-F02','ILS-Godown/MG-F03',
+'ILS-Godown/MG-F06',
+'ILS-Godown/MG-F07',
+'ILS-Godown/MG-F09',
+'ILS-Godown/MG-R01-S1',
+'ILS-Godown/MG-R01-S2',
+'ILS-Godown/MG-R01-S3',
+'ILS-Godown/MG-R01-S4',
+'ILS-Godown/MG-R01-S5',
+'ILS-Godown/MG-R01-S6',
+'ILS-Godown/MG-R02-S1',
+'ILS-Godown/MG-R02-S2',
+'ILS-Godown/MG-R02-S3',
+'ILS-Godown/MG-R02-S4',
+'ILS-Godown/MG-R02-S5',
+'ILS-Godown/MG-R03-S1',
+'ILS-Godown/MG-R03-S2',
+'ILS-Godown/MG-R03-S3',
+'ILS-Godown/MG-R03-S4',
+'ILS-Godown/MG-R03-S5',
+'ILS-Godown/MG-R04-S1',
+'ILS-Godown/MG-R04-S2',
+'ILS-Godown/MG-R04-S3',
+'ILS-Godown/MG-R04-S4',
+'ILS-Godown/MG-R04-S5',
+'ILS-Godown/MG-R04-S6',
+'ILS-Godown/MG-R05-S1',
+'ILS-Godown/MG-R05-S2',
+'ILS-Godown/MG-R05-S3',
+'ILS-Godown/MG-R05-S4',
+'ILS-Godown/MG-R05-S5',
+'ILS-Godown/MG-R06-S1',
+'ILS-Godown/MG-R06-S2',
+'ILS-Godown/MG-R06-S3',
+'ILS-Godown/MG-R06-S4',
+'ILS-Godown/MG-R06-S5',
+'ILS-Godown/MG-R06-S6',
+'ILS-Godown/MG-R07-S1',
+'ILS-Godown/MG-R07-S2',
+'ILS-Godown/MG-R07-S3',
+'ILS-Godown/MG-R07-S4',
+'ILS-Godown/MG-R07-S5',
+'ILS-Godown/MG-R07-S6',
+'ILS-Godown/MG-R08-S1',
+'ILS-Godown/MG-R08-S2',
+'ILS-Godown/MG-R08-S3',
+'ILS-Godown/MG-R08-S4',
+'ILS-Godown/MG-R08-S5',
+'ILS-Godown/MG-R08-S6',
+'ILS-Godown/MG-R09-S1',
+'ILS-Godown/MG-R09-S2',
+'ILS-Godown/MG-R09-S3',
+'ILS-Godown/MG-R09-S4',
+'ILS-Godown/MG-R09-S5',
+'ILS-Godown/MG-R09-S6',
+'ILS-Godown/MG-R10-S1',
+'ILS-Godown/MG-R10-S2',
+'ILS-Godown/MG-R10-S3',
+'ILS-Godown/MG-R10-S4',
+'ILS-Godown/MG-R10-S5',
+'ILS-Godown/MG-R10-S6',
+'ILS-Godown/MG-R11-S1',
+'ILS-Godown/MG-R11-S2',
+'ILS-Godown/MG-R11-S3',
+'ILS-Godown/MG-R11-S4',
+'ILS-Godown/MG-R11-S5',
+'ILS-Godown/MG-R11-S6',
+'ILS-Godown/MG-R12-S6',
+'ILS-Godown/MG-R13-S1',
+'ILS-Godown/MG-R13-S2',
+'ILS-Godown/MG-R13-S3',
+'ILS-Godown/MG-R13-S4',
+'ILS-Godown/MG-R13-S5',
+'ILS-Godown/MG-R13-S6',
+'ILS-Godown/MG-R14-S1',
+'ILS-Godown/MG-R14-S2',
+'ILS-Godown/MG-R14-S3',
+'ILS-Godown/MG-R14-S4',
+'ILS-Godown/MG-R14-S5',
+'ILS-Godown/MG-R15-S1',
+'ILS-Godown/MG-R15-S2',
+'ILS-Godown/MG-R15-S3',
+'ILS-Godown/MG-R15-S4',
+'ILS-Godown/MG-R15-S5',
+'ILS-Godown/MG-R16-S1',
+'ILS-Godown/MG-R16-S2',
+'ILS-Godown/MG-R16-S3',
+'ILS-Godown/MG-R16-S4',
+'ILS-Godown/MG-R16-S5',
+'ILS-Godown/MG-R16-S6',
+'ILS-Godown/MG-R18-S1',
+'ILS-Godown/MG-R18-S2',
+'ILS-Godown/MG-R18-S3',
+'ILS-Godown/MG-R18-S4',
+'ILS-Godown/MG-R18-S5',
+'ILS-Godown/MG-R19-S1',
+'ILS-Godown/MG-R19-S2',
+'ILS-Godown/MG-R19-S3',
+'ILS-Godown/MG-R19-S4',
+'ILS-Godown/MG-R19-S5',
+'ILS-Godown/MG-R20-S1',
+'ILS-Godown/MG-R20-S2',
+'ILS-Godown/MG-R20-S3',
+'ILS-Godown/MG-R20-S4',
+'ILS-Godown/MG-R20-S5',
+'ILS-Godown/MG-R21-S1',
+'ILS-Godown/MG-R21-S2',
+'ILS-Godown/MG-R21-S3',
+'ILS-Godown/MG-R21-S4',
+'ILS-Godown/MG-R22-S1',
+'ILS-Godown/MG-R22-S2',
+'ILS-Godown/MG-R22-S4',
+'ILS-Godown/MG-R23-S1',
+'ILS-Godown/MG-R23-S2',
+'ILS-Godown/MG-R23-S3',
+'ILS-Godown/MG-R23-S4',
+'ILS-Godown/MG-R24-S1',
+'ILS-Godown/MG-R24-S2',
+'ILS-Godown/MG-R24-S3',
+'ILS-Godown/MG-R24-S4',
+'ILS-Godown/MG-R24-S5',
+'ILS-Godown/MG-R24-S6',
+'ILS-Godown/MG-R25-S1',
+'ILS-Godown/MG-R25-S2',
+'ILS-Godown/MG-R25-S3',
+'ILS-Godown/MG-R25-S4',
+'ILS-Godown/MG-R25-S5',
+'ILS-Godown/MG-R25-S6',
+'ILS-Godown/MG-R26-S1',
+'ILS-Godown/MG-R26-S2',
+'ILS-Godown/MG-R26-S3',
+'ILS-Godown/MG-R26-S4',
+'ILS-Godown/MG-R26-S5',
+'ILS-Godown/MG-R26-S6',
+'ILS-Godown/MG-R27-S1',
+'ILS-Godown/MG-R27-S2',
+'ILS-Godown/MG-R27-S3',
+'ILS-Godown/MG-R27-S4',
+'ILS-Godown/MG-R27-S5',
+'ILS-Godown/MG-R28-S1',
+'ILS-Godown/MG-R28-S2',
+'ILS-Godown/MG-R28-S3',
+'ILS-Godown/MG-R28-S4',
+'ILS-Godown/MG-R28-S5',
+'ILS-Godown/MG-R28-S6',
+'ILS-Godown/MG-R29-S1',
+'ILS-Godown/MG-R29-S2',
+'ILS-Godown/MG-R29-S3',
+'ILS-Godown/MG-R29-S4',
+'ILS-Godown/MG-R29-S5',
+'ILS-Godown/MG-R29-S6',
+'ILS-Godown/MG-R30-S1',
+'ILS-Godown/MG-R30-S2',
+'ILS-Godown/MG-R30-S3',
+'ILS-Godown/MG-R30-S4',
+'ILS-Godown/MG-R30-S5',
+'ILS-Godown/MG-R30-S6',
+'ILS-Godown/MG-R31-S1',
+'ILS-Godown/MG-R31-S2',
+'ILS-Godown/MG-R31-S3',
+'ILS-Godown/MG-R31-S4',
+'ILS-Godown/MG-R31-S5',
+'ILS-Godown/MG-R32-S1',
+'ILS-Godown/MG-R32-S4',
+'ILS-Godown/MG-R32-S5',
+'ILS-Godown/MG-R32-S6',
+'ILS-Godown/MG-U01',
+'ILS-Godown/MG-U02',
+'ILS-Godown/MG-U03',
+'ILS-Godown/MG-U04',
+'ILS-Godown/MG-U05',
+'ILS-Godown/MG-U06',
+'ILS-Godown/MG-U08',
+'ILS-Godown/MG-U09',
+'ILS-Godown/MG-U10',
+'ILS-Godown/MG-U11',
+'ILS-Godown/MG-U12',
+'ILS-Godown/MG-U13',
+'ILS-Godown/MG-U14',
+'ILS-Godown/MG-U15',
+'ILS-IYC/AY',
+'ILS-IYC/LB',
+'ILS-IYC/Main',
+'ILS-IYC/NLD',
+'ILS-IYC/VU',
+'ILS-MS/ILS-Floor',
+'ILS-MS/ILS-Floor/Billing1',
+'ILS-MS/ILS-Floor/Billing2',
+'ILS-MS/ILS-Floor/Books',
+'ILS-MS/ILS-Floor/Craft',
+'ILS-MS/ILS-Floor/Discount',
+'ILS-MS/ILS-Floor/Food',
+'ILS-MS/ILS-Floor/Jewellery',
+'ILS-MS/ILS-Floor/Old Floor',
+'ILS-MS/ILS-Floor/Photos',
+'ILS-MS/ILS-Floor/Sarees',
+'ILS-MS/ILS-Garments',
+'ILS-MS/ILS-Garments/Billing',
+'ILS-MS/ILS-Garments/Kurta',
+'ILS-MS/ILS-Garments/Pants',
+'ILS-MS/ILS-Garments/Shawls',
+'ILS-MS/ILS-Garments/Tshirt'])
+and exists (
+select 1 from stock_warehouse w 
+where w.id = l.warehouse_id and w.name = ('Isha Life Store Ashram'))),
+
+aggregated_stock as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sq.quantity) as current_qty
+from stock_quant sq
+join product_product pp on sq.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join location_filter lf on sq.location_id = lf.id
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+warehouse_location_filter as (
+select l.id
+from stock_location l
+where l.complete_name ilike any (array['%Domestic%', 'MP1/Stock', 'SIN/Stock'])
+and exists (
+select 1 from stock_warehouse w 
+where w.id = l.warehouse_id and w.name in ('FG Warehouse MP', 'FG Warehouse MP 1','FG Warehouse SIN')
+)),
+
+warehouse_aggregated_stock as (
+select 
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sq.quantity) as current_qty
+from stock_quant sq
+join product_product pp on sq.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join warehouse_location_filter wlf on sq.location_id = wlf.id
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+warehouse_sales_invoice as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(sol.product_uom_qty) as total_sold_3m
+from sale_order_line sol
+join sale_order so on sol.order_id = so.id
+join product_product pp on sol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+left join crm_team t on so.team_id = t.id
+cross join date_config dc
+where so.state not in ('draft', 'sent', 'cancel')
+and so.date_order >= dc.start_3m
+and so.date_order < dc.end_date
+and (
+case
+when position('Amazon Sales - MA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz MH'
+when position('Amazon Sales - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz TN'
+when position('Amazon Sales - KA' in (t.name #>> array['en_US'])::text) > 0 then 'Amz KA'
+when position('Amazon Sales FBM - TN' in (t.name #>> array['en_US'])::text) > 0 then 'Amz FBM'
+when position('Local Sales - MH' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('MIAL Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Airport'
+when position('E-Com' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when position('Ecom' in (t.name #>> array['en_US'])::text) > 0 then 'Ecommerce'
+when (position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 or position('Local Sales' in (t.name #>> array['en_US'])::text) > 0) 
+ and so.partner_id in (select id from res_partner where name = 'A P Exports') then 'A P Exports'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30307, 230462) then 'IL Europe'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id in (30305, 216914) then 'IL UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 4953 then 'IF UK'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23980 then 'IF Australia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 132583 then 'IF Malaysia'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 23982 then 'IF Hong Kong'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 30303 then 'IF Canada'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 and so.partner_id = 2006 then 'IF USA'
+when position('Export Sales' in (t.name #>> array['en_US'])::text) > 0 then 'Yantra'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 
+and so.partner_id in (select id from res_partner where name in (
+'Isha Business Pvt Ltd', 'Isha Crafts Private Limited', 'Isha Design', 'Isha Education',
+'Isha Foundation', 'Isha Foundation - Delhi', 'Isha Foundation - Karnataka', 'Isha Home School',
+'Isha Institute of Inner Sciences', 'Isha Life Hyderabad Yoga Studio LLP', 'Isha Outreach',
+'Isha Outreach - Karnataka', 'Isha Sacred Walks', 'Isha Utsav', 'Sadhguru Academy',
+'Sadhguru Academy - KA', 'Shri Yogini Trust', 'Thenkailaya Bakthi Peravai')) then 'Isha Entities'
+when position('Local Sales' in (t.name #>> array['en_US'])::text) > 0 then 'B2B Vira'
+else (t.name #>> array['en_US'])::text
+end is not null
+)
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+warehouse_sales_pos as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(pol.qty) as total_sold_3m
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+join account_journal aj on po.sale_journal = aj.id
+cross join date_config dc
+where po.state in ('done', 'invoiced', 'paid')
+and po.date_order >= dc.start_3m
+and po.date_order < dc.end_date
+and (aj.name #>> '{}')::text ilike any (array[
+'%TN Point of Sale%',
+'%KA Point of Sale%',
+'%UP Point of Sale%',
+'%DH Point of Sale%'
+])
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+warehouse_aggregated_sales as (
+select base_sku, sum(total_sold_3m) as total_sold_3m
+from (
+select * from warehouse_sales_invoice
+union all
+select * from warehouse_sales_pos
+) t
+group by base_sku),
+
+sales_pos as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+sum(pol.qty) as total_sold_3m
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join pos_config pc on po.config_id = pc.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+cross join date_config dc
+where po.state in ('done', 'invoiced', 'paid')
+and po.date_order >= dc.start_3m
+and po.date_order < dc.end_date
+and pc.name in (
+'Isha Life Store AY',
+'Isha Life Store LB',
+'Isha Life Store Main',
+'Isha Life Store VU',
+'Isha Life Store Nalanda')
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+aggregated_price as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+coalesce(sum(pol.price_subtotal) / nullif(sum(pol.qty), 0), 0) as avg_selling_price
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join pos_config pc on po.config_id = pc.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+cross join date_config dc
+where po.state in ('done', 'invoiced', 'paid')
+and po.date_order >= dc.start_3m
+and po.date_order < dc.end_date
+and pc.name in (
+'Isha Life Store AY',
+'Isha Life Store LB',
+'Isha Life Store Main',
+'Isha Life Store VU',
+'Isha Life Store Nalanda')
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+aggregated_price_3y as (
+select
+coalesce(pp_base.default_code, pp.default_code) as base_sku,
+coalesce(sum(pol.price_subtotal) / nullif(sum(pol.qty), 0), 0) as avg_selling_price_3y
+from pos_order_line pol
+join pos_order po on pol.order_id = po.id
+join pos_config pc on po.config_id = pc.id
+join product_product pp on pol.product_id = pp.id
+left join product_product pp_base on 
+(pp.default_code like '%-IN' or pp.default_code like '%old') 
+and pp_base.default_code = regexp_replace(regexp_replace(pp.default_code, '-IN$', ''), 'old$', '')
+where po.state in ('done', 'invoiced', 'paid')
+and po.date_order >= date_trunc('month', current_date) - interval '3 years'
+and po.date_order < date_trunc('month', current_date)::date
+and pc.name in (
+'Isha Life Store AY',
+'Isha Life Store LB',
+'Isha Life Store Main',
+'Isha Life Store VU',
+'Isha Life Store Nalanda')
+group by coalesce(pp_base.default_code, pp.default_code)),
+
+prepared as (
+select
+su.base_sku,
+su.product_name,
+su.l1,
+su.abc as abc_classification,
+coalesce(ast.current_qty, 0) as qty,
+coalesce(sp.total_sold_3m, 0) as total_sold_3m,
+coalesce(pr.avg_selling_price, 0) as avg_selling_price,
+coalesce(pr3y.avg_selling_price_3y, 0) as avg_selling_price_3y,
+-- Warehouse columns
+coalesce(wast.current_qty, 0) as w_qty,
+coalesce(was.total_sold_3m, 0) as w_total_sold_3m,
+dc.days_3m,
+dc.days_current_month
+from sku_unique su
+cross join date_config dc
+left join aggregated_stock ast on su.base_sku = ast.base_sku
+left join sales_pos sp on su.base_sku = sp.base_sku
+left join aggregated_price pr on su.base_sku = pr.base_sku
+left join aggregated_price_3y pr3y on su.base_sku = pr3y.base_sku
+left join warehouse_aggregated_stock wast on su.base_sku = wast.base_sku
+left join warehouse_aggregated_sales was on su.base_sku = was.base_sku
+where coalesce(ast.current_qty, 0) != 0 
+or coalesce(sp.total_sold_3m, 0) != 0)
+
+select
+product_name as "Product",
+base_sku as "SKU",
+l1 as "Category L1",
+abc_classification as "ABC Classification",
+round(avg_selling_price, 1) as "Avg Selling Price",
+qty as "SOH",
+round(case when days_3m > 0 then total_sold_3m / days_3m else 0 end) as "Daily Avg Sales QTY",
+round(qty / nullif(case when days_3m > 0 then total_sold_3m / days_3m else 0 end, 0), 0) as "Days Coverage",
+round(qty / nullif((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month, 0), 1) as "Month Coverage",
+round((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month, 0) as "3M Avg Sales (Units/ Month)",
+round(least(qty, (case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month), 0) as "Coverage basis P3M Avg (Units)",
+round(greatest((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month - qty, 0), 0) as "Shortage (Units)",
+round(greatest((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month * 1.5 - qty, 0), 0) as "Shortage to 1.5M (Units)",
+round(((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month) * avg_selling_price, 0) as "3M Avg Sales (INR)",
+round(least(qty, (case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month) * avg_selling_price, 0) as "Coverage basis P3M Avg (INR)",
+round(greatest((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month - qty, 0) * avg_selling_price, 0) as "Shortage (INR)",
+round(greatest((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month * 1.5 - qty, 0) * avg_selling_price, 0) as "Shortage to 1.5M (INR)",
+round(avg_selling_price_3y, 1) as "3Y Avg Selling Price",
+round(coalesce(nullif(avg_selling_price_3y, 0), avg_selling_price) * qty) as "Total Value (INR@SP)",
+concat(round(
+(least(qty, (case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month) * avg_selling_price 
+/ nullif(((case when days_3m > 0 then total_sold_3m / days_3m else 0 end) * days_current_month) * avg_selling_price, 0)) * 100,
+1), '%') as "CFR",
+
+w_qty as "W.SOH",
+round(w_qty / nullif((case when days_3m > 0 then w_total_sold_3m / days_3m else 0 end) * days_current_month, 0), 1) as "W.Month Coverage"
+
+from prepared
+where base_sku not like '%-IN' and base_sku not like '%old'
+order by "Daily Avg Sales QTY" desc nulls last, "Days Coverage" asc nulls last;
