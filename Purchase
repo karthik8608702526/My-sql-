@@ -1,0 +1,93 @@
+WITH base_data AS (
+    SELECT 
+        po.id AS po_id_raw,
+        po.partner_id,
+        pol.product_id,
+        po.picking_type_id,
+        pr.create_date::date AS pr_create_date,
+        pr.write_date::date AS pr_approved_date,
+        po.date_order::date AS po_date,
+        po.name AS po_id,
+        pp.default_code AS sku,
+        pol.product_qty AS order_qty,
+        COALESCE(pol.qty_received, 0) AS received_qty,
+        pol.price_unit AS unit_cost,
+        pol.date_planned::date AS po_expected_date,
+        rec.max_date_done::date AS received_date,
+        
+        -- Raw Lead Time for completed orders
+        CASE 
+            WHEN rec.max_date_done IS NOT NULL THEN 
+                GREATEST(0, (rec.max_date_done::date - pr.write_date::date))
+        END AS actual_lead_time
+    FROM 
+        purchase_order po
+    JOIN 
+        purchase_order_line pol ON po.id = pol.order_id
+    LEFT JOIN 
+        res_partner ON po.partner_id = res_partner.id
+    LEFT JOIN 
+        product_product pp ON pol.product_id = pp.id
+    LEFT JOIN 
+        purchase_request_purchase_order_line_rel rel ON rel.purchase_order_line_id = pol.id
+    LEFT JOIN 
+        purchase_request_line prl ON rel.purchase_request_line_id = prl.id
+    LEFT JOIN 
+        purchase_request pr ON prl.request_id = pr.id
+    LEFT JOIN LATERAL (
+        SELECT MAX(sp.date_done) AS max_date_done
+        FROM stock_move sm
+        JOIN stock_picking sp ON sm.picking_id = sp.id
+        WHERE sm.purchase_line_id = pol.id 
+          AND sp.state = 'done'
+    ) rec ON true
+    WHERE 
+        pr.write_date IS NOT NULL
+        AND pp.default_code IS NOT NULL 
+        AND TRIM(pp.default_code) != ''
+        AND po.state IN ('purchase', 'done')
+        AND po.state != 'cancel'
+        AND pr.state NOT IN ('cancel', 'rejected')
+        AND (res_partner.name NOT ILIKE '%Isha Life%' OR res_partner.name IS NULL)
+),
+aggregated_metrics AS (
+    SELECT 
+        *,
+        -- Historical Max & Avg Lead Time per Vendor + SKU
+        COALESCE(MAX(actual_lead_time) OVER(PARTITION BY partner_id, product_id), 0) AS max_lead_time_days,
+        ROUND(COALESCE(AVG(actual_lead_time) OVER(PARTITION BY partner_id, product_id), 0)::numeric, 1) AS avg_lead_time_days
+    FROM base_data
+)
+SELECT 
+    m.po_id AS "POID",
+    m.po_date AS "PODate",
+    (m.pr_approved_date + (m.max_lead_time_days * INTERVAL '1 day'))::date AS "ExpectedDate",
+    m.received_date AS "ReceiptDate",
+    m.product_id AS "ProductKey",
+    m.partner_id AS "SupplierKey",
+    stock_warehouse.name AS "Location",
+    m.order_qty AS "OrderedQt",
+    m.received_qty AS "ReceivedQt",
+    GREATEST(0, (m.order_qty - m.received_qty)) AS "OpenQty",
+    CASE 
+        WHEN m.received_qty >= m.order_qty THEN 'Completed'
+        WHEN m.received_qty > 0 THEN 'Partially Received'
+        ELSE 'Open'
+    END AS "POStatus",
+    m.unit_cost AS "UnitCost"
+
+FROM 
+    aggregated_metrics m
+LEFT JOIN 
+    res_partner ON m.partner_id = res_partner.id
+LEFT JOIN 
+    stock_picking_type spt ON m.picking_type_id = spt.id
+LEFT JOIN 
+    stock_warehouse ON spt.warehouse_id = stock_warehouse.id
+WHERE 
+    1=1
+    [[ AND res_partner.name ILIKE '%' || {{supplier_name}} || '%' ]]
+    [[ AND {{warehouse_filter}} ]]
+    [[ AND {{date_filter}} ]]
+ORDER BY 
+    m.po_date DESC;
