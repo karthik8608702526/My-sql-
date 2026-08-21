@@ -1,0 +1,74 @@
+WITH pr_receipt_lead_times AS (
+    -- Calculate maximum lead time from Purchase Request to Stock Receipt (in months)
+    SELECT 
+        prl.product_id,
+        ROUND(
+            MAX(EXTRACT(DAY FROM (sm.date - COALESCE(pr.date_start, pr.create_date))))::numeric / 30.0, 2
+        ) AS pr_max_lead_time_months
+    FROM purchase_request_line prl
+    JOIN purchase_request pr ON prl.request_id = pr.id
+    JOIN purchase_request_purchase_order_line_rel rel ON rel.purchase_request_line_id = prl.id
+    JOIN purchase_order_line pol ON pol.id = rel.purchase_order_line_id
+    JOIN stock_move sm ON sm.purchase_line_id = pol.id
+    WHERE pr.state IN ('approved', 'done')
+      AND sm.state = 'done'
+    GROUP BY prl.product_id
+),
+
+ved_classified AS (
+    -- Classify products based on Lead Time and Shelf Life
+    SELECT 
+        pp.id AS product_id,
+        
+        -- Lead time in months for reference
+        COALESCE(pr_lt.pr_max_lead_time_months, 0) AS max_lead_time_months,
+        
+        -- Shelf life in months for reference
+        ROUND(
+            COALESCE(NULLIF(pt.expiration_time, 0), NULLIF(pt.use_time, 0), 0) / 30.0, 1
+        ) AS shelf_life_months,
+
+        -- VED Categorization Logic
+        CASE 
+            -- VITAL: Long Lead Time (>= 2 Months) OR Very Short Shelf Life (<= 3 Months)
+            WHEN COALESCE(pr_lt.pr_max_lead_time_months, 0) >= 2.0 
+                 OR (ROUND(COALESCE(NULLIF(pt.expiration_time, 0), NULLIF(pt.use_time, 0), 0) / 30.0, 1) BETWEEN 0.1 AND 3.0)
+            THEN 'V'
+
+            -- ESSENTIAL: Moderate Lead Time (>= 1 Month) OR Medium Shelf Life (3.1 to 6 Months)
+            WHEN COALESCE(pr_lt.pr_max_lead_time_months, 0) >= 1.0 
+                 OR (ROUND(COALESCE(NULLIF(pt.expiration_time, 0), NULLIF(pt.use_time, 0), 0) / 30.0, 1) BETWEEN 3.1 AND 6.0)
+            THEN 'E'
+
+            -- DESIRABLE: Low risk items (Short lead times & non-perishable)
+            ELSE 'D'
+        END AS ved_class
+    FROM product_product pp
+    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+    LEFT JOIN pr_receipt_lead_times pr_lt ON pr_lt.product_id = pp.id
+)
+
+--------------------------------------------------------------------------------
+-- FINAL VED OUTPUT
+--------------------------------------------------------------------------------
+SELECT 
+    pp.default_code AS sku,
+    CASE 
+        WHEN pg_typeof(pt.name)::text = 'jsonb' OR pg_typeof(pt.name)::text = 'json' 
+        THEN COALESCE(pt.name->>'en_US', pt.name::text)
+        ELSE pt.name::text
+    END AS product_name,
+
+    -- VED Classification Output
+    ved.ved_class,
+
+    -- Supporting Metrics for Validation
+    ved.max_lead_time_months,
+    ved.shelf_life_months
+
+FROM product_product pp
+JOIN product_template pt ON pp.product_tmpl_id = pt.id
+JOIN ved_classified ved ON ved.product_id = pp.id
+WHERE pp.default_code IS NOT NULL 
+  AND TRIM(pp.default_code) != ''
+ORDER BY ved.ved_class DESC, pp.default_code ASC;
